@@ -27,6 +27,15 @@ impl Shader {
         start..start + self.csize as usize
     }
 
+    /// Inflates the record's DXBC container from the SGD5 table it was parsed from.
+    pub fn dxbc(&self, data: &[u8]) -> Result<Vec<u8>> {
+        use std::io::Read;
+        let raw = data.get(self.payload()).ok_or_else(|| anyhow::anyhow!("record {} runs past the table", self.name))?;
+        let mut out = Vec::with_capacity(self.dsize as usize);
+        flate2::read::DeflateDecoder::new(raw).read_to_end(&mut out)?;
+        Ok(out)
+    }
+
     /// Pipeline stage named in the record (`PS`, `VS`, `CS`, `MS`, ...): the first
     /// `_`-separated token that is a stage, else a stage prefix, else `?`.
     pub fn stage(&self) -> &'static str {

@@ -118,6 +118,27 @@ enum Command {
         #[arg(long)]
         summary: bool,
     },
+    /// List pipelines in a PS09 pipeline cache entry
+    Pipelines {
+        archive: PathBuf,
+        /// Entry index; `5/3` descends into nested RPF9s
+        index: String,
+        /// Only graphics pipelines with a mesh (NGG) shader
+        #[arg(long)]
+        mesh: bool,
+    },
+    /// Dump FSSM root-signature layouts of the shaders in an SGD5 entry
+    Fssm {
+        archive: PathBuf,
+        /// Entry index; `5/3` descends into nested RPF9s
+        index: String,
+        /// Full layout and used resources of one shader record
+        #[arg(long, conflicts_with = "roots")]
+        shader: Option<usize>,
+        /// One root-parameter line per program
+        #[arg(long)]
+        roots: bool,
+    },
     /// Show Bink 2 video header info
     Bink {
         archive: PathBuf,
@@ -220,6 +241,8 @@ fn main() -> Result<()> {
         }
         Command::Awc { archive, index } => cmd_awc(&load_entry(&archive, &crypto, &index)?),
         Command::Shaders { archive, index, summary } => cmd_shaders(&load_entry(&archive, &crypto, &index)?, summary),
+        Command::Pipelines { archive, index, mesh } => cmd_pipelines(&load_entry(&archive, &crypto, &index)?, mesh),
+        Command::Fssm { archive, index, shader, roots } => cmd_fssm(&load_entry(&archive, &crypto, &index)?, shader, roots),
         Command::Bink { archive, index } => cmd_bink(&load_entry(&archive, &crypto, &index)?),
         Command::Resource { archive, index } => cmd_resource(&load_entry(&archive, &crypto, &index)?),
         Command::Mod(ModCommand::Apply { manifest, output, archive }) => {
@@ -477,6 +500,95 @@ fn cmd_shaders(bytes: &[u8], summary: bool) -> Result<()> {
     for ((stage, tag), n) in counts {
         println!("  {stage:<3} {tag:#04x} {:<13} {n}", formats::sgd5::tag_name(tag));
     }
+    Ok(())
+}
+
+fn cmd_pipelines(bytes: &[u8], mesh_only: bool) -> Result<()> {
+    use formats::ps09;
+    let c = ps09::parse(bytes)?;
+    let h = &c.header;
+    println!("PS09 {} driver {}: {} graphics, {} compute, {} metadata, {} shaders ({} code bytes)",
+        h.id, h.driver, h.graphics, h.compute, h.metas, h.shaders, h.code_bytes);
+    let mut patterns = std::collections::BTreeMap::new();
+    for (i, p) in c.graphics.iter().enumerate() {
+        let slots: Vec<String> = p.slots.iter().enumerate()
+            .filter_map(|(s, slot)| slot.map(|x| format!("{}={}", ps09::SLOT_NAMES[s], x.shader))).collect();
+        let pattern: Vec<&str> = slots.iter().map(|s| s.split('=').next().unwrap()).collect();
+        *patterns.entry(pattern.join("+")).or_insert(0usize) += 1;
+        if !mesh_only || p.is_mesh() {
+            println!("  G#{i:<6} {:016x}  {} shaders  {}", p.hash, p.shader_count(), slots.join(" "));
+        }
+    }
+    if !mesh_only {
+        for (i, p) in c.compute.iter().enumerate() {
+            println!("  C#{i:<6} {:016x}  1 shaders  CS={}", p.hash, p.shader);
+        }
+    }
+    let truncated = c.shaders.iter().filter(|r| r.end > bytes.len()).count();
+    if truncated > 0 { println!("warning: {truncated} code blocks run past the end of the blob"); }
+    for (pattern, n) in patterns { println!("  {pattern:<10} {n} graphics pipelines"); }
+    Ok(())
+}
+
+/// The FSSM programs of one SGD5 record (one per XBCH section).
+fn record_programs(sgd: &[u8], rec: &formats::sgd5::Shader) -> Result<Vec<formats::fssm::Fssm>> {
+    let dxbc = rec.dxbc(sgd)?;
+    formats::xbch::sections(&dxbc)?.into_iter()
+        .map(|x| formats::fssm::parse(&formats::xbch::decompress(x)?))
+        .collect()
+}
+
+fn root_line(stage: &formats::fssm::Stage) -> String {
+    let params: Vec<String> = stage.root_params().iter().map(|p| p.to_string()).collect();
+    let samplers = match stage.static_samplers() { 0 => String::new(), n => format!(" + {n} static samplers") };
+    format!("{} root params [{}]{samplers}", params.len(), params.join(", "))
+}
+
+fn cmd_fssm(bytes: &[u8], shader: Option<usize>, roots: bool) -> Result<()> {
+    use formats::fssm;
+    let records = formats::sgd5::parse(bytes)?;
+    if let Some(i) = shader {
+        let rec = records.get(i).ok_or_else(|| anyhow::anyhow!("shader {i} out of range ({} records)", records.len()))?;
+        println!("#{i} {} (tag {:#04x})", rec.name, rec.tag);
+        for (n, prog) in record_programs(bytes, rec)?.iter().enumerate() {
+            for s in &prog.stages {
+                println!("  program {n}: FSSM v{:#x} {} (api {}) code {:#x}+{:#x} {} user SGPRs {}",
+                    prog.version, s.name(), s.api, s.code_offset, s.code_size, s.user_sgpr_count, if s.wave32 { "wave32" } else { "wave64" });
+                println!("    {}", root_line(s));
+                println!("    layout ({}):", s.layout.len());
+                for e in &s.layout {
+                    println!("      {:<13} reg {:<4} table+{:<4} sgprs {}  s{:<2} slot {}",
+                        fssm::root_type_name(e.root_type), e.register, e.table_offset, e.user_sgprs, e.first_user_data, e.root_slot);
+                }
+                println!("    used ({}):", s.used.len());
+                for u in &s.used {
+                    println!("      {:<7} {:<13} reg {:<4} table+{:<4} stride {:<4} {}dw  s{:<2} slot {}",
+                        fssm::resource_type_name(u.resource_type), fssm::root_type_name(u.root_type as u32),
+                        u.lower_bound, u.table_offset, u.stride, u.descriptor_dwords, u.first_user_data, u.root_slot);
+                }
+            }
+        }
+        return Ok(());
+    }
+    // (stage, programs, with a root layout); failures counted separately.
+    let mut counts: std::collections::BTreeMap<&str, (usize, usize)> = Default::default();
+    let mut failed = 0;
+    for rec in &records {
+        match record_programs(bytes, rec) {
+            Ok(progs) => for s in progs.iter().flat_map(|p| &p.stages) {
+                let c = counts.entry(s.name()).or_default();
+                c.0 += 1;
+                if !s.layout.is_empty() { c.1 += 1; }
+                if roots { println!("{} {}: {}", s.name(), rec.name, root_line(s)); }
+            },
+            Err(e) => {
+                failed += 1;
+                if roots { eprintln!("? {}: {e}", rec.name); }
+            }
+        }
+    }
+    println!("{} records, {failed} without a readable FSSM program", records.len());
+    for (stage, (n, with)) in counts { println!("  {stage:<3} {n:>6} programs, {with} with a root layout"); }
     Ok(())
 }
 

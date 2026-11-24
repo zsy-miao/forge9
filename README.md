@@ -59,6 +59,16 @@ forge9 awc audio.rpf 12/0
 forge9 shaders shaders.rpf 2
 forge9 shaders shaders.rpf 0 --summary     # counts per stage and tag
 
+# Root-signature layout of each native (FSSM) program: one line per program,
+# e.g. "MS <name>: 6 root params [Table(261 entries, s8, p0), ..., ResourceHeap(s15)]"
+forge9 fssm shaders.rpf 0 --roots
+forge9 fssm shaders.rpf 2 --shader 2       # full layout + used resources of one record
+forge9 fssm shaders.rpf 0                  # programs per stage
+
+# Driver pipeline cache (PS09): graphics/compute PSOs and their shader slots
+forge9 pipelines shaders.rpf 1
+forge9 pipelines shaders.rpf 1 --mesh      # only PSOs with a mesh (NGG) shader
+
 # Bink 2 video: dimensions, frame count, frame rate, duration
 forge9 bink archive.rpf 3
 
@@ -113,6 +123,8 @@ given (uncompressed); readers detect zlib per entry, so plain payloads read back
 | PSIN / PSO game data | `PSIN` | `psin` | Block table, struct schemas |
 | AWC audio | `ADAT` | `awc` | Stream table, chunks, formats (Opus, XMA2, PCM); no decode |
 | SGD5 shader database | `SGD5` | `shaders` | Record names, stages, tags, sizes; DXBC payload offsets |
+| Xbox shader program | `XBCH` → `FSSM` | `fssm` | XDAT section 0x0D inflated; stages, root layout, used resources |
+| Pipeline cache | `PS 00 09` | `pipelines` | Header, graphics/compute PSO records, shader slots, metadata and code ranges |
 | Bink 2 video | `KB2?` | `bink` | Header: size, frames, dimensions, frame rate |
 | Paged resource | `0DRP` | `resource` | Kind detection, virtual/physical pointer resolution |
 | RDS5 texture store | `RDS5` | `texture` | Chunk table, ETPF index; BCPack BC1 decode to DDS/PNG (mip 0) |
@@ -135,6 +147,9 @@ src/
   formats/          payload decoders (one file per format)
     awc.rs          AWC audio containers
     sgd5.rs         SGD5 shader databases
+    xbch.rs         DXBC → XDAT → XBCH unwrap (zlib → FSSM)
+    fssm.rs         FSSM programs: stages, root layout, used resources
+    ps09.rs         PS09 driver pipeline cache
     bink.rs         Bink 2 video headers
     resource.rs     0DRP paged resources
     texture.rs      RDS5 texture stores (via bcpack-rs)
