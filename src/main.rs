@@ -139,6 +139,18 @@ enum Command {
         #[arg(long)]
         roots: bool,
     },
+    /// Classify the RDNA2 machine code of the shaders in an SGD5 entry, counting wave64-sensitive ops
+    Isa {
+        archive: PathBuf,
+        /// Entry index; `5/3` descends into nested RPF9s
+        index: String,
+        /// Only aggregate counts per stage and op family
+        #[arg(long, conflicts_with = "shader")]
+        summary: bool,
+        /// Full family breakdown of one shader record
+        #[arg(long)]
+        shader: Option<usize>,
+    },
     /// Show Bink 2 video header info
     Bink {
         archive: PathBuf,
@@ -243,6 +255,7 @@ fn main() -> Result<()> {
         Command::Shaders { archive, index, summary } => cmd_shaders(&load_entry(&archive, &crypto, &index)?, summary),
         Command::Pipelines { archive, index, mesh } => cmd_pipelines(&load_entry(&archive, &crypto, &index)?, mesh),
         Command::Fssm { archive, index, shader, roots } => cmd_fssm(&load_entry(&archive, &crypto, &index)?, shader, roots),
+        Command::Isa { archive, index, summary, shader } => cmd_isa(&load_entry(&archive, &crypto, &index)?, summary, shader),
         Command::Bink { archive, index } => cmd_bink(&load_entry(&archive, &crypto, &index)?),
         Command::Resource { archive, index } => cmd_resource(&load_entry(&archive, &crypto, &index)?),
         Command::Mod(ModCommand::Apply { manifest, output, archive }) => {
@@ -632,6 +645,124 @@ fn cmd_texture(path: &PathBuf, extract: Option<usize>, decode: Option<usize>, ou
     for t in &texs {
         let array = if t.array_size > 1 { format!(" x{}", t.array_size) } else { String::new() };
         println!("  #{:<5} {:>5}x{:<5}{array} {:<5} (dxgi {:>2}) mips {:>2} tile {}  hash {:016x}", t.index, t.width, t.height, texture::dxgi_name(t.dxgi), t.dxgi, t.mips, t.tile_mode, t.hash);
+    }
+    Ok(())
+}
+
+/// Each FSSM stage of one SGD5 record with its classified machine code.
+fn record_isa(sgd: &[u8], rec: &formats::sgd5::Shader) -> Result<Vec<(formats::fssm::Stage, formats::rdna2::Stats)>> {
+    let mut out = Vec::new();
+    for x in formats::xbch::sections(&rec.dxbc(sgd)?)? {
+        let blob = formats::xbch::decompress(x)?;
+        for s in formats::fssm::parse(&blob)?.stages {
+            let code = blob.get(s.code_offset as usize..(s.code_offset + s.code_size) as usize)
+                .with_context(|| format!("code {:#x}+{:#x} past the {:#x}-byte FSSM", s.code_offset, s.code_size, blob.len()))?;
+            out.push((s, formats::rdna2::analyze(code)));
+        }
+    }
+    Ok(out)
+}
+
+fn wave_name(s: &formats::fssm::Stage) -> &'static str { if s.wave32 { "w32" } else { "w64" } }
+
+fn isa_status(st: &formats::rdna2::Stats) -> String {
+    if st.clean() { return "ok".into(); }
+    let mut why = Vec::new();
+    if st.unknown() > 0 { why.push(format!("{} unknown", st.unknown())); }
+    if st.truncated { why.push("truncated".into()); }
+    if st.bad_targets > 0 { why.push(format!("{} bad branch targets", st.bad_targets)); }
+    if st.exits == 0 { why.push("no exit".into()); }
+    format!("DESYNC({})", why.join(", "))
+}
+
+fn cmd_isa(bytes: &[u8], summary: bool, shader: Option<usize>) -> Result<()> {
+    use formats::rdna2::{FAMILIES, WAVE_OPS, WaveOp};
+    use std::collections::BTreeMap;
+    let records = formats::sgd5::parse(bytes)?;
+    if let Some(i) = shader {
+        let rec = records.get(i).ok_or_else(|| anyhow::anyhow!("shader {i} out of range ({} records)", records.len()))?;
+        println!("#{i} {} (tag {:#04x})", rec.name, rec.tag);
+        for (n, (s, st)) in record_isa(bytes, rec)?.iter().enumerate() {
+            println!("  program {n}: {} {} code {:#x}+{:#x}: {} instructions, {} s_endpgm, {} data dwords, {}",
+                s.name(), wave_name(s), s.code_offset, s.code_size, st.insts, st.endpgms, st.data_dwords, isa_status(st));
+            println!("    families:");
+            for f in FAMILIES.iter().filter(|&&f| st.family(f) > 0) { println!("      {:<8} {:>6}", f.name(), st.family(*f)); }
+            println!("    wave64-sensitive:");
+            for o in WAVE_OPS.iter().filter(|&&o| st.op(o) > 0) { println!("      {:<15} {:>6}", o.name(), st.op(*o)); }
+        }
+        return Ok(());
+    }
+
+    // Per stage: programs, wave64, instructions, clean, unknown dwords.
+    let mut stages: BTreeMap<&str, [u64; 5]> = BTreeMap::new();
+    let mut families = [0u64; FAMILIES.len()];
+    // Per op: (stage -> wave64 programs using it), wave32 programs using it, total occurrences.
+    let mut ops: Vec<(BTreeMap<&str, u64>, u64, u64)> = vec![Default::default(); WAVE_OPS.len()];
+    let mut groups: BTreeMap<&str, BTreeMap<&str, u64>> = BTreeMap::new();
+    let mut failed = 0;
+    const GROUPS: [(&str, &[WaveOp]); 5] = [
+        ("any DPP16/DPP8", &[WaveOp::DppQuadPerm, WaveOp::DppRowShift, WaveOp::DppRowMirror, WaveOp::DppRowShare, WaveOp::DppRowXmask, WaveOp::DppOther, WaveOp::Dpp8]),
+        ("any permute (ds_[b]permute, permlane, swizzle)", &[WaveOp::DsPermute, WaveOp::Permlane, WaveOp::DsSwizzle]),
+        ("any lane read/write (readlane, writelane, readfirstlane)", &[WaveOp::LaneHi, WaveOp::Readlane, WaveOp::Writelane, WaveOp::Readfirstlane]),
+        ("crosses the 32-lane halves (ds_permute, lane_32_63, readfirstlane, mbcnt_hi, 64-bit masks)", &[WaveOp::DsPermute, WaveOp::LaneHi, WaveOp::Readfirstlane, WaveOp::MbcntHi, WaveOp::ExecMask64, WaveOp::MaskScan64, WaveOp::QuadMask64]),
+        ("any 64-bit mask op (exec/vcc b64, mask scan, mbcnt_hi, quad/wqm)", &[WaveOp::ExecMask64, WaveOp::MaskScan64, WaveOp::MbcntHi, WaveOp::QuadMask64]),
+    ];
+    for (i, rec) in records.iter().enumerate() {
+        let progs = match record_isa(bytes, rec) {
+            Ok(p) => p,
+            Err(e) => { failed += 1; if !summary { eprintln!("? #{i} {}: {e}", rec.name); } continue; }
+        };
+        for (s, st) in &progs {
+            let c = stages.entry(s.name()).or_default();
+            c[0] += 1;
+            c[1] += !s.wave32 as u64;
+            c[2] += st.insts as u64;
+            c[3] += st.clean() as u64;
+            c[4] += st.unknown() as u64;
+            for (t, &n) in families.iter_mut().zip(&st.families) { *t += n as u64; }
+            for (o, &n) in WAVE_OPS.iter().zip(&st.wave) {
+                let e = &mut ops[*o as usize];
+                e.2 += n as u64;
+                if n == 0 { continue; }
+                if s.wave32 { e.1 += 1; } else { *e.0.entry(s.name()).or_default() += 1; }
+            }
+            if !s.wave32 {
+                for (g, members) in GROUPS {
+                    if members.iter().any(|&o| st.op(o) > 0) { *groups.entry(g).or_default().entry(s.name()).or_default() += 1; }
+                }
+            }
+            if !summary {
+                let used: Vec<String> = WAVE_OPS.iter().filter(|&&o| st.op(o) > 0).map(|o| format!("{}={}", o.name(), st.op(*o))).collect();
+                println!("#{i:<5} {} {} {:>6} insts  {}  [{}]  {}", s.name(), wave_name(s), st.insts, isa_status(st), used.join(" "), rec.name);
+            }
+        }
+    }
+
+    let total: [u64; 5] = stages.values().fold([0; 5], |a, c| std::array::from_fn(|k| a[k] + c[k]));
+    println!("{} records, {failed} without a readable FSSM program; {} programs, {} instructions, {} decoded cleanly, {} unknown dwords",
+        records.len(), total[0], total[2], total[3], total[4]);
+    println!("  stage  programs  wave64  instructions  clean  unknown");
+    for (stage, c) in &stages { println!("  {stage:<5} {:>9} {:>7} {:>13} {:>6} {:>8}", c[0], c[1], c[2], c[3], c[4]); }
+    println!("instructions by family:");
+    for (f, n) in FAMILIES.iter().zip(families).filter(|(_, n)| *n > 0) {
+        println!("  {:<8} {n:>12}  {:>5.1}%", f.name(), 100.0 * n as f64 / total[2].max(1) as f64);
+    }
+    let names: Vec<&str> = stages.keys().copied().collect();
+    let header: String = names.iter().map(|s| format!(" {s:>6}")).collect();
+    println!("wave64 programs using each op, by stage (most widespread first):");
+    println!("  {:<15} {:>7}{header} {:>6} {:>12}", "op", "w64", "w32", "occurrences");
+    let mut order: Vec<usize> = (0..WAVE_OPS.len()).collect();
+    order.sort_by_key(|&k| std::cmp::Reverse(ops[k].0.values().sum::<u64>()));
+    for k in order {
+        let (by, w32, occ) = &ops[k];
+        let cols: String = names.iter().map(|s| format!(" {:>6}", by.get(s).copied().unwrap_or(0))).collect();
+        println!("  {:<15} {:>7}{cols} {w32:>6} {occ:>12}", WAVE_OPS[k].name(), by.values().sum::<u64>());
+    }
+    println!("wave64 programs by op group:");
+    for (g, _) in GROUPS {
+        let by = groups.get(g).cloned().unwrap_or_default();
+        let cols: String = names.iter().map(|s| format!(" {s}={}", by.get(s).copied().unwrap_or(0))).collect();
+        println!("  {:>6}  {g}:{cols}", by.values().sum::<u64>());
     }
     Ok(())
 }

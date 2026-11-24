@@ -4,6 +4,7 @@ pub mod awc;
 pub mod bink;
 pub mod fssm;
 pub mod ps09;
+pub mod rdna2;
 pub mod resource;
 pub mod sgd5;
 pub mod texture;
