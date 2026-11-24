@@ -579,7 +579,10 @@ fn cmd_fssm(bytes: &[u8], shader: Option<usize>, roots: bool) -> Result<()> {
                 let c = counts.entry(s.name()).or_default();
                 c.0 += 1;
                 if !s.layout.is_empty() { c.1 += 1; }
-                if roots { println!("{} {}: {}", s.name(), rec.name, root_line(s)); }
+                if roots {
+                    let wave = if s.wave32 { "w32" } else { "w64" };
+                    println!("{} {} {}: {}", s.name(), wave, rec.name, root_line(s));
+                }
             },
             Err(e) => {
                 failed += 1;

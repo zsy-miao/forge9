@@ -46,3 +46,23 @@ Top 3 patterns cover 10% of all mesh shaders:
 - 197-entry variant (261)
 
 The binding model is highly uniform. A single rootmem.rs implementation handling these 7 parameter types would cover 100% of mesh shaders.
+
+## Wave size requirements
+
+Extracted from FSSM flags (bit 5 at +0x14) across all 25,194 shader programs.
+
+**100% of mesh shaders require wave64.** No mesh shader uses wave32.
+
+| Stage | Wave64 | Wave32 | % wave64 |
+|-------|--------|--------|----------|
+| MS    | 9,282  | 0      | 100%     |
+| VS    | 1,931  | 0      | 100%     |
+| PS    | 9,817  | 1,127  | 89.7%    |
+| CS    | 1,112  | 1,535  | 42.0%    |
+| ES/GS | 390    | 0      | 100%     |
+| **Total** | **22,532** | **2,662** | **89.4%** |
+
+Implications for PC port:
+- AMD RDNA2/3 GPUs support wave64 natively (this is why XCL runs furthest on AMD)
+- NVIDIA GPUs use warp32 natively and must emulate wave64 for all mesh/vertex/geometry shaders
+- Only pixel shaders and compute shaders have wave32 variants available
