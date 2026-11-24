@@ -1,0 +1,31 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-pc-windows-msvc, os: windows-latest, ext: .exe }
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest, ext: "" }
+          - { target: aarch64-apple-darwin, os: macos-latest, ext: "" }
+          - { target: x86_64-apple-darwin, os: macos-latest, ext: "" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --target ${{ matrix.target }}
+      - shell: bash
+        run: cp target/${{ matrix.target }}/release/forge9${{ matrix.ext }} forge9-${{ matrix.target }}${{ matrix.ext }}
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: forge9-${{ matrix.target }}${{ matrix.ext }}
