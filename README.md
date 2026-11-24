@@ -19,6 +19,16 @@ RPF9 is a container format used by a well-known retail game engine. This tool ha
 - **JSON output** for integration with other tools
 - **Library crate**: every decoder is usable from Rust as `forge9::formats::*`
 
+## Install
+
+Prebuilt binaries for Windows (x86_64), Linux (x86_64) and macOS (arm64, x86_64) are on the [Releases page](https://github.com/nineforge0/forge9/releases): download `forge9-<target>` (`.exe` on Windows) and put it on your `PATH`.
+
+Or build from source with a stable Rust toolchain:
+
+```bash
+cargo install --git https://github.com/nineforge0/forge9
+```
+
 ## Usage
 
 ```bash

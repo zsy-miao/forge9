@@ -5,7 +5,9 @@ edition = "2024"
 description = "General-purpose toolkit for RPF9 archives — read, decrypt, inspect, extract and analyze"
 license = "MIT"
 repository = "https://github.com/nineforge0/forge9"
+readme = "README.md"
 keywords = ["rpf9", "archive", "toolkit", "extraction"]
+categories = ["command-line-utilities", "game-development"]
 
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
