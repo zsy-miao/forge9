@@ -2,7 +2,7 @@
 //!
 //! Not a disassembler: it walks a program's dwords, sizes each instruction
 //! (base encoding + literal / DPP / SDWA / MIMG NSA dwords) and tags it with
-//! its encoding family and, where it has one, a wave64-sensitive op class.
+//! its encoding family, opcode and, where it has one, a wave64-sensitive op class.
 //!
 //! Encodings are picked by the top bits of the first dword:
 //!
@@ -120,12 +120,25 @@ pub enum Flow {
 pub struct Inst {
     pub len: usize,
     pub family: Family,
+    /// Opcode within the family (see [`opcode_name`]).
+    pub op: u16,
     pub wave: Option<WaveOp>,
     /// `s_endpgm` and its `_saved` / `_ordered_ps_done` forms.
     pub endpgm: bool,
     /// `s_code_end`: padding after the program.
     pub code_end: bool,
     pub flow: Flow,
+}
+
+/// Mnemonic of `op` in `family`, or `None` if the opcode is unassigned in GFX10.3.
+pub fn opcode_name(family: Family, op: u16) -> Option<&'static str> {
+    let t = super::rdna2_ops::OPCODES;
+    t.binary_search_by_key(&(family, op), |&(f, o, _)| (f, o)).ok().map(|i| t[i].2)
+}
+
+/// [`opcode_name`], or a stable synthetic `VOP3_op0x1a7` for unassigned opcodes.
+pub fn opcode_label(family: Family, op: u16) -> String {
+    opcode_name(family, op).map_or_else(|| format!("{}_op{op:#05x}", family.name()), str::to_string)
 }
 
 const LITERAL: u32 = 255;
@@ -137,7 +150,7 @@ const EXEC_LO: u32 = 126;
 pub fn decode(code: &[u8]) -> Option<Inst> {
     let dw = |i: usize| code.get(i * 4..i * 4 + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
     let w = dw(0)?;
-    let mut inst = Inst { len: 4, family: Family::Unknown, wave: None, endpgm: false, code_end: false, flow: Flow::Next };
+    let mut inst = Inst { len: 4, family: Family::Unknown, op: 0, wave: None, endpgm: false, code_end: false, flow: Flow::Next };
     let mut words = 1;
     let lit = |srcs: &[u32]| srcs.contains(&LITERAL) as usize;
 
@@ -148,6 +161,11 @@ pub fn decode(code: &[u8]) -> Option<Inst> {
             0x3E => Family::Vopc,
             _ => Family::Vop2,
         };
+        inst.op = match inst.family {
+            Family::Vop1 => (w >> 9) & 0xFF,
+            Family::Vopc => (w >> 17) & 0xFF,
+            _ => (w >> 25) & 0x3F,
+        } as u16;
         match src0 {
             0xF9 => words += 1,
             0xFA => {
@@ -164,6 +182,12 @@ pub fn decode(code: &[u8]) -> Option<Inst> {
         }
     } else if w >> 30 == 0b10 {
         let (s0, s1, sdst) = (w & 0xFF, (w >> 8) & 0xFF, (w >> 16) & 0x7F);
+        inst.op = match w >> 23 {
+            0x17D => (w >> 8) & 0xFF,
+            0x17E | 0x17F => (w >> 16) & 0x7F,
+            _ if w >> 28 == 0xB => (w >> 23) & 0x1F,
+            _ => (w >> 23) & 0x7F,
+        } as u16;
         match w >> 23 {
             0x17D => {
                 inst.family = Family::Sop1;
@@ -246,6 +270,17 @@ pub fn decode(code: &[u8]) -> Option<Inst> {
             0x3E => { inst.family = Family::Exp; words = 2; }
             _ => {}
         }
+        inst.op = match inst.family {
+            Family::Vintrp => (w >> 16) & 3,
+            Family::Vop3p => (w >> 16) & 0x7F,
+            Family::Vop3 => (w >> 16) & 0x3FF,
+            Family::Ds | Family::Smem => (w >> 18) & 0xFF,
+            Family::Flat | Family::Global | Family::Scratch => (w >> 18) & 0x7F,
+            Family::Mubuf => (w >> 18) & 0x7F | (w >> 25 & 1) << 7,
+            Family::Mtbuf => (w >> 16) & 7 | (w1? >> 21 & 1) << 3,
+            Family::Mimg => (w >> 18) & 0x7F | (w & 1) << 7,
+            _ => 0,
+        } as u16;
         if inst.family == Family::Unknown { words = 1; }
     }
     inst.len = words * 4;
@@ -280,6 +315,8 @@ pub struct Stats {
     pub insts: u32,
     pub families: [u32; FAMILIES.len()],
     pub wave: [u32; WAVE_OPS.len()],
+    /// Instructions per (family, opcode).
+    pub opcodes: std::collections::BTreeMap<(Family, u16), u32>,
     pub endpgms: u32,
     /// Paths that left the program: `s_endpgm*`, or `s_setpc_b64` (the ES half
     /// of a merged ES+GS program tail-jumps to its GS half).
@@ -326,6 +363,7 @@ pub fn analyze(code: &[u8]) -> Stats {
             mark[at / 4 + 1..at / 4 + i.len / 4].fill(2);
             s.insts += 1;
             s.families[i.family as usize] += 1;
+            *s.opcodes.entry((i.family, i.op)).or_default() += 1;
             if let Some(w) = i.wave { s.wave[w as usize] += 1; }
             s.endpgms += i.endpgm as u32;
             if i.family == Family::Unknown { break; }
@@ -404,6 +442,24 @@ mod tests {
         assert_eq!((one(&[0xC000_0000]).family, one(&[0xC000_0000]).len), (Family::Unknown, 4));
         // truncated: VOP3 needs two dwords
         assert!(decode(&bytes(&[0xD760_0000])).is_none());
+    }
+
+    #[test]
+    fn names_opcodes() {
+        let name = |w: &[u32]| { let i = decode(&bytes(w)).unwrap(); opcode_label(i.family, i.op) };
+        assert_eq!(name(&[0xBE80_03FF, 0]), "s_mov_b32");
+        assert_eq!(name(&[0xBF81_0000]), "s_endpgm");
+        assert_eq!(name(&[0x7E00_0501]), "v_readfirstlane_b32");
+        assert_eq!(name(&[0x4200_0300, 0]), "v_madak_f32"); // console-only gfx10.1 op
+        assert_eq!(name(&[0xD760_0000, 0x0000_0501]), "v_readlane_b32");
+        assert_eq!(name(&[0xDACC_0000, 0]), "ds_bpermute_b32");
+        assert_eq!(name(&[0xDC30_8000, 0]), "global_load_dword");
+        assert_eq!(name(&[0xE030_0000, 0]), "buffer_load_dword");
+        assert_eq!(name(&[0xF080_0F04, 0, 0, 0]), "image_sample");
+        assert_eq!(name(&[0xF400_0000, 0]), "s_load_dword");
+        assert_eq!(opcode_label(Family::Vop3, 0x3FF), "VOP3_op0x3ff");
+        // Table is sorted for binary search.
+        assert!(super::super::rdna2_ops::OPCODES.windows(2).all(|p| (p[0].0, p[0].1) < (p[1].0, p[1].1)));
     }
 
     #[test]

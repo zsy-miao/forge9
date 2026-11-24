@@ -153,6 +153,15 @@ enum Command {
         /// Rank the N heaviest programs by instruction count (a compile-cost proxy)
         #[arg(long, conflicts_with_all = ["summary", "shader"], value_name = "N")]
         heavy: Option<usize>,
+        /// Opcode census: each distinct opcode's occurrences and programs using it
+        #[arg(long, conflicts_with_all = ["summary", "shader", "heavy"])]
+        opcodes: bool,
+        /// With --opcodes: only programs of this hardware stage (LS HS ES GS VS PS CS MS)
+        #[arg(long, requires = "opcodes")]
+        stage: Option<String>,
+        /// With --shader: write each program's raw machine code to PREFIX.<n>.<stage>.bin
+        #[arg(long, requires = "shader", value_name = "PREFIX")]
+        dump: Option<PathBuf>,
     },
     /// Show Bink 2 video header info
     Bink {
@@ -280,7 +289,10 @@ fn main() -> Result<()> {
         Command::Shaders { archive, index, summary } => cmd_shaders(&load_entry(&archive, &crypto, &index)?, summary),
         Command::Pipelines { archive, index, mesh } => cmd_pipelines(&load_entry(&archive, &crypto, &index)?, mesh),
         Command::Fssm { archive, index, shader, roots } => cmd_fssm(&load_entry(&archive, &crypto, &index)?, shader, roots),
-        Command::Isa { archive, index, summary, shader, heavy } => cmd_isa(&load_entry(&archive, &crypto, &index)?, summary, shader, heavy),
+        Command::Isa { archive, index, summary, shader, heavy, opcodes, stage, dump } => {
+            let bytes = load_entry(&archive, &crypto, &index)?;
+            if opcodes { cmd_isa_opcodes(&bytes, stage.as_deref()) } else { cmd_isa(&bytes, summary, shader, heavy, dump.as_deref()) }
+        }
         Command::Bink { archive, index } => cmd_bink(&load_entry(&archive, &crypto, &index)?),
         Command::Resource { archive, index } => cmd_resource(&load_entry(&archive, &crypto, &index)?),
         Command::Mod(ModCommand::Apply { manifest, output, archive }) => {
@@ -675,18 +687,69 @@ fn cmd_texture(path: &PathBuf, extract: Option<usize>, decode: Option<usize>, ou
     Ok(())
 }
 
-/// Each FSSM stage of one SGD5 record with its classified machine code.
-fn record_isa(sgd: &[u8], rec: &formats::sgd5::Shader) -> Result<Vec<(formats::fssm::Stage, formats::rdna2::Stats)>> {
+/// Each FSSM stage of one SGD5 record with its raw machine code.
+fn record_code(sgd: &[u8], rec: &formats::sgd5::Shader) -> Result<Vec<(formats::fssm::Stage, Vec<u8>)>> {
     let mut out = Vec::new();
     for x in formats::xbch::sections(&rec.dxbc(sgd)?)? {
         let blob = formats::xbch::decompress(x)?;
         for s in formats::fssm::parse(&blob)?.stages {
             let code = blob.get(s.code_offset as usize..(s.code_offset + s.code_size) as usize)
                 .with_context(|| format!("code {:#x}+{:#x} past the {:#x}-byte FSSM", s.code_offset, s.code_size, blob.len()))?;
-            out.push((s, formats::rdna2::analyze(code)));
+            out.push((s, code.to_vec()));
         }
     }
     Ok(out)
+}
+
+/// Each FSSM stage of one SGD5 record with its classified machine code.
+fn record_isa(sgd: &[u8], rec: &formats::sgd5::Shader) -> Result<Vec<(formats::fssm::Stage, formats::rdna2::Stats)>> {
+    Ok(record_code(sgd, rec)?.into_iter().map(|(s, c)| { let st = formats::rdna2::analyze(&c); (s, st) }).collect())
+}
+
+/// Every distinct opcode across the entry's programs, most executed first.
+fn cmd_isa_opcodes(bytes: &[u8], stage: Option<&str>) -> Result<()> {
+    use formats::rdna2::{opcode_label, opcode_name, Family};
+    use std::collections::{BTreeMap, BTreeSet};
+    let records = formats::sgd5::parse(bytes)?;
+    // (family, op) -> (occurrences, programs); stage -> (programs, distinct opcodes).
+    let mut ops: BTreeMap<(Family, u16), (u64, u64)> = BTreeMap::new();
+    let mut by_stage: BTreeMap<&str, (u64, BTreeSet<(Family, u16)>)> = BTreeMap::new();
+    let (mut programs, mut failed) = (0u64, 0);
+    for rec in &records {
+        let Ok(progs) = record_isa(bytes, rec) else { failed += 1; continue };
+        for (s, st) in progs.iter().filter(|(s, _)| stage.is_none_or(|w| s.name().eq_ignore_ascii_case(w))) {
+            programs += 1;
+            let e = by_stage.entry(s.name()).or_default();
+            e.0 += 1;
+            for (&k, &n) in &st.opcodes {
+                let o = ops.entry(k).or_default();
+                o.0 += n as u64;
+                o.1 += 1;
+                if k.0 != Family::Unknown { e.1.insert(k); }
+            }
+        }
+    }
+    let unknown = ops.remove(&(Family::Unknown, 0)).unwrap_or_default();
+    let mut rows: Vec<_> = ops.into_iter().collect();
+    rows.sort_by(|a, b| b.1.0.cmp(&a.1.0).then(a.0.cmp(&b.0)));
+    let total: u64 = rows.iter().map(|r| r.1.0).sum();
+    let unnamed = rows.iter().filter(|((f, o), _)| opcode_name(*f, *o).is_none()).count();
+    let cover = |pct: f64| {
+        let mut cum = 0;
+        rows.iter().position(|r| { cum += r.1.0; cum as f64 >= pct / 100.0 * total as f64 }).map_or(0, |i| i + 1)
+    };
+    println!("{} records ({failed} without a readable FSSM program), {programs} programs{}", records.len(), stage.map(|s| format!(" of stage {s}")).unwrap_or_default());
+    println!("{} distinct opcodes, {total} instructions; {unnamed} opcodes unassigned in GFX10.3 (synthetic names); {} undecodable dwords in {} programs",
+        rows.len(), unknown.0, unknown.1);
+    println!("{} opcodes cover 90% of instructions, {} cover 99%, {} cover 99.9%", cover(90.0), cover(99.0), cover(99.9));
+    println!("distinct opcodes by stage:{}", by_stage.iter().map(|(s, (n, set))| format!(" {s}={} ({n} programs)", set.len())).collect::<String>());
+    println!("  rank  occurrences  share    cum%  programs  family  opcode");
+    let mut cum = 0;
+    for (i, ((f, o), (n, p))) in rows.iter().enumerate() {
+        cum += n;
+        println!("  {:>4} {n:>12} {:>5.2}% {:>6.2}% {p:>9}  {:<7} {}", i + 1, 100.0 * *n as f64 / total as f64, 100.0 * cum as f64 / total as f64, f.name(), opcode_label(*f, *o));
+    }
+    Ok(())
 }
 
 fn wave_name(s: &formats::fssm::Stage) -> &'static str { if s.wave32 { "w32" } else { "w64" } }
@@ -701,7 +764,7 @@ fn isa_status(st: &formats::rdna2::Stats) -> String {
     format!("DESYNC({})", why.join(", "))
 }
 
-fn cmd_isa(bytes: &[u8], summary: bool, shader: Option<usize>, heavy: Option<usize>) -> Result<()> {
+fn cmd_isa(bytes: &[u8], summary: bool, shader: Option<usize>, heavy: Option<usize>, dump: Option<&std::path::Path>) -> Result<()> {
     use formats::rdna2::{FAMILIES, WAVE_OPS, WaveOp};
     use std::collections::BTreeMap;
     let records = formats::sgd5::parse(bytes)?;
@@ -725,6 +788,14 @@ fn cmd_isa(bytes: &[u8], summary: bool, shader: Option<usize>, heavy: Option<usi
     if let Some(i) = shader {
         let rec = records.get(i).ok_or_else(|| anyhow::anyhow!("shader {i} out of range ({} records)", records.len()))?;
         println!("#{i} {} (tag {:#04x})", rec.name, rec.tag);
+        if let Some(prefix) = dump {
+            for (n, (s, code)) in record_code(bytes, rec)?.iter().enumerate() {
+                let out = format!("{}.{n}.{}.bin", prefix.display(), s.name());
+                std::fs::write(&out, code)?;
+                println!("  program {n}: {} {} {} bytes → {out}", s.name(), wave_name(s), code.len());
+            }
+            return Ok(());
+        }
         for (n, (s, st)) in record_isa(bytes, rec)?.iter().enumerate() {
             println!("  program {n}: {} {} code {:#x}+{:#x}: {} instructions, {} s_endpgm, {} data dwords, {}",
                 s.name(), wave_name(s), s.code_offset, s.code_size, st.insts, st.endpgms, st.data_dwords, isa_status(st));
