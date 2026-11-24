@@ -7,6 +7,8 @@ pub mod drawable;
 pub mod fssm;
 pub mod ps09;
 pub mod rdna2;
+pub mod rdna2_disasm;
+mod rdna2_operands;
 mod rdna2_ops;
 pub mod resource;
 pub mod sgd5;

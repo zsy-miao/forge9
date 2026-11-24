@@ -166,6 +166,18 @@ enum Command {
         #[arg(long, requires = "shader", value_name = "PREFIX")]
         dump: Option<PathBuf>,
     },
+    /// Disassemble the RDNA2 machine code of one shader record (LLVM-style syntax)
+    Disasm {
+        archive: PathBuf,
+        /// Entry index; `5/3` descends into nested RPF9s
+        index: String,
+        /// Shader record to disassemble
+        #[arg(long)]
+        shader: usize,
+        /// Also print each instruction's dwords in hex
+        #[arg(long)]
+        raw: bool,
+    },
     /// Show Bink 2 video header info
     Bink {
         archive: PathBuf,
@@ -311,6 +323,7 @@ fn main() -> Result<()> {
             let bytes = load_entry(&archive, &crypto, &index)?;
             if let Some(n) = uniformity { cmd_isa_uniformity(&bytes, n) } else if opcodes { cmd_isa_opcodes(&bytes, stage.as_deref()) } else { cmd_isa(&bytes, summary, shader, heavy, dump.as_deref()) }
         }
+        Command::Disasm { archive, index, shader, raw } => cmd_disasm(&load_entry(&archive, &crypto, &index)?, shader, raw),
         Command::Bink { archive, index } => cmd_bink(&load_entry(&archive, &crypto, &index)?),
         Command::Resource { archive, index } => cmd_resource(&load_entry(&archive, &crypto, &index)?),
         Command::Model { archive, index, output, obj, lod } => cmd_model(&load_entry_blocks(&archive, &crypto, &index)?, output, obj, lod),
@@ -978,6 +991,28 @@ fn cmd_isa(bytes: &[u8], summary: bool, shader: Option<usize>, heavy: Option<usi
         let by = groups.get(g).cloned().unwrap_or_default();
         let cols: String = names.iter().map(|s| format!(" {s}={}", by.get(s).copied().unwrap_or(0))).collect();
         println!("  {:>6}  {g}:{cols}", by.values().sum::<u64>());
+    }
+    Ok(())
+}
+
+fn cmd_disasm(bytes: &[u8], shader: usize, raw: bool) -> Result<()> {
+    use std::io::Write;
+    let records = formats::sgd5::parse(bytes)?;
+    let rec = records.get(shader).ok_or_else(|| anyhow::anyhow!("shader {shader} out of range ({} records)", records.len()))?;
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "#{shader} {} (tag {:#04x})", rec.name, rec.tag)?;
+    for (n, (s, code)) in record_code(bytes, rec)?.iter().enumerate() {
+        let (st, lines) = formats::rdna2_disasm::disassemble(code, s.wave32);
+        writeln!(out, "program {n}: {} {} code {:#x}+{:#x}: {} instructions, {} data dwords, {}",
+            s.name(), wave_name(s), s.code_offset, s.code_size, st.insts, st.data_dwords, isa_status(&st))?;
+        for l in &lines {
+            if raw {
+                let words: Vec<String> = l.words.iter().map(|w| format!("{w:08x}")).collect();
+                writeln!(out, "  {:#06x}  {:<26}  {}", l.addr, words.join(" "), l.text)?;
+            } else {
+                writeln!(out, "  {:#06x}  {}", l.addr, l.text)?;
+            }
+        }
     }
     Ok(())
 }
