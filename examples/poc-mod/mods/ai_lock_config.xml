@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Modular__SM__AIBehaviour__LockControllerConfig xmlns:xi="http://www.w3.org/2001/XInclude">
+	<MutexMap>
+		<Item key="Cast">
+			Mutex_AIBehaviour_Cast
+		</Item>
+		<Item key="BehaviourGroup">
+			Mutex_AIBehaviour_Group
+		</Item>
+		<Item key="CommunicationArea">
+			Mutex_AIBehaviour_CommunicationArea
+		</Item>
+	</MutexMap>
+	<LockPriority>
+		<Item>Cast</Item>
+		<Item>BehaviourGroup</Item>
+		<Item>CommunicationArea</Item>
+	</LockPriority>
+	<!-- Modified by forge9 proof-of-concept mod -->
+</Modular__SM__AIBehaviour__LockControllerConfig>

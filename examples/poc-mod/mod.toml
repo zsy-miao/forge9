@@ -1,0 +1,9 @@
+[mod]
+name = "poc-ai-config"
+version = "0.1.0"
+description = "Proof-of-concept mod: adds a comment to the AI lock controller config"
+target_archive = "common.rpf"
+
+[[replace]]
+entry = 6
+file = "mods/ai_lock_config.xml"
