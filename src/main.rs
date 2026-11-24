@@ -156,6 +156,9 @@ enum Command {
         /// Opcode census: each distinct opcode's occurrences and programs using it
         #[arg(long, conflicts_with_all = ["summary", "shader", "heavy"])]
         opcodes: bool,
+        /// EXEC-uniformity: share of vector instructions provably under a full EXEC (guard foldable), overall, per stage and for the N heaviest programs (default 30)
+        #[arg(long, conflicts_with_all = ["summary", "shader", "heavy", "opcodes"], value_name = "N", num_args = 0..=1, default_missing_value = "30")]
+        uniformity: Option<usize>,
         /// With --opcodes: only programs of this hardware stage (LS HS ES GS VS PS CS MS)
         #[arg(long, requires = "opcodes")]
         stage: Option<String>,
@@ -289,9 +292,9 @@ fn main() -> Result<()> {
         Command::Shaders { archive, index, summary } => cmd_shaders(&load_entry(&archive, &crypto, &index)?, summary),
         Command::Pipelines { archive, index, mesh } => cmd_pipelines(&load_entry(&archive, &crypto, &index)?, mesh),
         Command::Fssm { archive, index, shader, roots } => cmd_fssm(&load_entry(&archive, &crypto, &index)?, shader, roots),
-        Command::Isa { archive, index, summary, shader, heavy, opcodes, stage, dump } => {
+        Command::Isa { archive, index, summary, shader, heavy, opcodes, uniformity, stage, dump } => {
             let bytes = load_entry(&archive, &crypto, &index)?;
-            if opcodes { cmd_isa_opcodes(&bytes, stage.as_deref()) } else { cmd_isa(&bytes, summary, shader, heavy, dump.as_deref()) }
+            if let Some(n) = uniformity { cmd_isa_uniformity(&bytes, n) } else if opcodes { cmd_isa_opcodes(&bytes, stage.as_deref()) } else { cmd_isa(&bytes, summary, shader, heavy, dump.as_deref()) }
         }
         Command::Bink { archive, index } => cmd_bink(&load_entry(&archive, &crypto, &index)?),
         Command::Resource { archive, index } => cmd_resource(&load_entry(&archive, &crypto, &index)?),
@@ -748,6 +751,55 @@ fn cmd_isa_opcodes(bytes: &[u8], stage: Option<&str>) -> Result<()> {
     for (i, ((f, o), (n, p))) in rows.iter().enumerate() {
         cum += n;
         println!("  {:>4} {n:>12} {:>5.2}% {:>6.2}% {p:>9}  {:<7} {}", i + 1, 100.0 * *n as f64 / total as f64, 100.0 * cum as f64 / total as f64, f.name(), opcode_label(*f, *o));
+    }
+    Ok(())
+}
+
+/// EXEC-uniform vs guarded vector instructions: overall, by stage, by size band and for the `top` heaviest programs.
+fn cmd_isa_uniformity(bytes: &[u8], top: usize) -> Result<()> {
+    use formats::uniformity::{analyze, Uniformity};
+    use std::collections::BTreeMap;
+    let records = formats::sgd5::parse(bytes)?;
+    let mut all: Vec<(u32, &str, bool, Uniformity, &str)> = Vec::new();
+    let mut failed = 0;
+    for rec in &records {
+        let Ok(progs) = record_code(bytes, rec) else { failed += 1; continue };
+        for (s, code) in progs {
+            all.push((formats::rdna2::analyze(&code).insts, s.name(), s.wave32, analyze(&code, s.wave32), &rec.name));
+        }
+    }
+    let pct = |u: &Uniformity| 100.0 * u.uniform as f64 / u.vector.max(1) as f64;
+    let per_run = |u: &Uniformity| u.guarded() as f64 / u.guard_runs.max(1) as f64;
+    let add = |a: &mut Uniformity, b: &Uniformity| { a.vector += b.vector; a.uniform += b.uniform; a.guard_runs += b.guard_runs; };
+    let line = |label: &str, n: u64, u: &Uniformity| println!("  {label:<10} {n:>8} {:>12} {:>12} {:>7.1}% {:>7.1}% {:>12} {:>9.1}",
+        u.vector, u.uniform, pct(u), 100.0 - pct(u), u.guard_runs, per_run(u));
+    let mut total = Uniformity::default();
+    let mut stages: BTreeMap<&str, (u64, Uniformity)> = BTreeMap::new();
+    const BANDS: [(u32, &str); 5] = [(0, "<2k"), (2_000, "2k-8k"), (8_000, "8k-20k"), (20_000, "20k-50k"), (50_000, ">=50k")];
+    let mut bands = [(0u64, Uniformity::default()); BANDS.len()];
+    for (insts, stage, _, u, _) in &all {
+        add(&mut total, u);
+        let e = stages.entry(stage).or_default();
+        e.0 += 1;
+        add(&mut e.1, u);
+        let b = &mut bands[BANDS.iter().rposition(|(lo, _)| insts >= lo).unwrap()];
+        b.0 += 1;
+        add(&mut b.1, u);
+    }
+    println!("{} records ({failed} without a readable FSSM program), {} programs", records.len(), all.len());
+    println!("uniform = vector instructions provably under a full EXEC (guard foldable); guard runs = guards left if one covers each straight-line run under one EXEC");
+    println!("  {:<10} {:>8} {:>12} {:>12} {:>8} {:>8} {:>12} {:>9}", "", "programs", "vector", "uniform", "uniform", "guarded", "guard runs", "insts/run");
+    line("all", all.len() as u64, &total);
+    println!("by stage:");
+    for (s, (n, u)) in &stages { line(s, *n, u); }
+    println!("by program size (instructions):");
+    for ((_, label), (n, u)) in BANDS.iter().zip(&bands) { line(label, *n, u); }
+    all.sort_by(|a, b| b.0.cmp(&a.0));
+    println!("{} heaviest programs:", top.min(all.len()));
+    println!("  {:>7} {:>7} {:>8} {:>8} {:>10} {:>9}  stage  shader", "insts", "vector", "uniform", "guarded", "guard runs", "insts/run");
+    for (insts, stage, w32, u, name) in all.iter().take(top) {
+        println!("  {insts:>7} {:>7} {:>7.1}% {:>7.1}% {:>10} {:>9.1}  {stage} {}  {name}",
+            u.vector, pct(u), 100.0 - pct(u), u.guard_runs, per_run(u), if *w32 { "w32" } else { "w64" });
     }
     Ok(())
 }
