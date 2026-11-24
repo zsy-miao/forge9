@@ -150,6 +150,9 @@ enum Command {
         /// Full family breakdown of one shader record
         #[arg(long)]
         shader: Option<usize>,
+        /// Rank the N heaviest programs by instruction count (a compile-cost proxy)
+        #[arg(long, conflicts_with_all = ["summary", "shader"], value_name = "N")]
+        heavy: Option<usize>,
     },
     /// Show Bink 2 video header info
     Bink {
@@ -277,7 +280,7 @@ fn main() -> Result<()> {
         Command::Shaders { archive, index, summary } => cmd_shaders(&load_entry(&archive, &crypto, &index)?, summary),
         Command::Pipelines { archive, index, mesh } => cmd_pipelines(&load_entry(&archive, &crypto, &index)?, mesh),
         Command::Fssm { archive, index, shader, roots } => cmd_fssm(&load_entry(&archive, &crypto, &index)?, shader, roots),
-        Command::Isa { archive, index, summary, shader } => cmd_isa(&load_entry(&archive, &crypto, &index)?, summary, shader),
+        Command::Isa { archive, index, summary, shader, heavy } => cmd_isa(&load_entry(&archive, &crypto, &index)?, summary, shader, heavy),
         Command::Bink { archive, index } => cmd_bink(&load_entry(&archive, &crypto, &index)?),
         Command::Resource { archive, index } => cmd_resource(&load_entry(&archive, &crypto, &index)?),
         Command::Mod(ModCommand::Apply { manifest, output, archive }) => {
@@ -698,10 +701,27 @@ fn isa_status(st: &formats::rdna2::Stats) -> String {
     format!("DESYNC({})", why.join(", "))
 }
 
-fn cmd_isa(bytes: &[u8], summary: bool, shader: Option<usize>) -> Result<()> {
+fn cmd_isa(bytes: &[u8], summary: bool, shader: Option<usize>, heavy: Option<usize>) -> Result<()> {
     use formats::rdna2::{FAMILIES, WAVE_OPS, WaveOp};
     use std::collections::BTreeMap;
     let records = formats::sgd5::parse(bytes)?;
+    if let Some(n) = heavy {
+        // Rank programs by instruction count — the heaviest drive DXC/driver compile cost.
+        let mut all: Vec<(u32, &str, bool, String)> = Vec::new();
+        for rec in &records {
+            if let Ok(progs) = record_isa(bytes, rec) {
+                for (s, st) in progs {
+                    all.push((st.insts, s.name(), s.wave32, rec.name.clone()));
+                }
+            }
+        }
+        all.sort_by(|a, b| b.0.cmp(&a.0));
+        println!("{} programs; {} heaviest by instruction count (compile-cost proxy):", all.len(), n.min(all.len()));
+        for (insts, stage, w32, name) in all.iter().take(n) {
+            println!("  {:>7}  {}  {}  {}", insts, stage, if *w32 { "w32" } else { "w64" }, name);
+        }
+        return Ok(());
+    }
     if let Some(i) = shader {
         let rec = records.get(i).ok_or_else(|| anyhow::anyhow!("shader {i} out of range ({} records)", records.len()))?;
         println!("#{i} {} (tag {:#04x})", rec.name, rec.tag);
