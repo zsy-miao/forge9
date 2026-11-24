@@ -163,7 +163,7 @@ enum Command {
         /// Entry index; `5/3` descends into nested RPF9s
         index: String,
     },
-    /// List textures in an RDS5 (.ttpf) store, or export one BC1 texture's mip 0
+    /// List textures in an RDS5 (.ttpf) store, or export one BC1/BC3/BC5/BC7 texture's mip 0
     Texture {
         store: PathBuf,
         /// Write this texture as DDS
@@ -175,6 +175,9 @@ enum Command {
         /// Output path (default: texture_<index>.dds / .png)
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Array slice to export (BC3/BC5/BC7)
+        #[arg(long, default_value_t = 0)]
+        slice: u32,
     },
     /// Entropy-stage analysis of BCPack BC3/BC5/BC6H/BC7 chunks: fragment headers, lane symbol stats
     BcpackAnalyze {
@@ -245,8 +248,8 @@ fn main() -> Result<()> {
         println!("ok: {} replacement(s)", m.replace.len());
         return Ok(());
     }
-    if let Command::Texture { store, extract, decode, output } = &cli.command {
-        return cmd_texture(store, *extract, *decode, output.clone());
+    if let Command::Texture { store, extract, decode, output, slice } = &cli.command {
+        return cmd_texture(store, *extract, *decode, output.clone(), *slice);
     }
     if let Command::BcpackAnalyze { store, chunk, codec, output, widths } = &cli.command {
         return cmd_bcpack_analyze(store, *chunk, codec.as_deref(), output.as_deref(), widths.as_deref());
@@ -643,7 +646,7 @@ fn cmd_resource(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn cmd_texture(path: &PathBuf, extract: Option<usize>, decode: Option<usize>, output: Option<PathBuf>) -> Result<()> {
+fn cmd_texture(path: &PathBuf, extract: Option<usize>, decode: Option<usize>, output: Option<PathBuf>, slice: u32) -> Result<()> {
     use formats::texture;
     let store = texture::Store::open(path).with_context(|| format!("opening {}", path.display()))?;
     let texs = store.textures()?;
@@ -651,10 +654,11 @@ fn cmd_texture(path: &PathBuf, extract: Option<usize>, decode: Option<usize>, ou
         let tex = texs.get(i).ok_or_else(|| anyhow::anyhow!("texture {i} out of range ({} textures)", texs.len()))?;
         let png = decode.is_some();
         let out = output.unwrap_or_else(|| PathBuf::from(format!("texture_{i}.{}", if png { "png" } else { "dds" })));
-        let (bytes, unfitted) = texture::export(&store, tex, png)?;
+        let (bytes, unfitted) = texture::export(&store, tex, png, slice)?;
         std::fs::write(&out, bytes)?;
-        println!("texture {i}: {}x{} mip 0 → {}", tex.width, tex.height, out.display());
-        if unfitted > 0 { println!("  warning: {unfitted} blocks use unfitted window slots and may be off"); }
+        let sl = if tex.array_size > 1 { format!(" slice {slice}") } else { String::new() };
+        println!("texture {i}: {} {}x{}{sl} mip 0 → {}", texture::dxgi_name(tex.dxgi), tex.width, tex.height, out.display());
+        if unfitted > 0 { println!("  warning: {unfitted} blocks depend on table values bcpack-rs marks undetermined and may be off"); }
         return Ok(());
     }
     let mut codecs = std::collections::BTreeMap::new();

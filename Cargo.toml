@@ -13,4 +13,5 @@ anyhow = "1"
 flate2 = "1"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
-bcpack-rs = { git = "https://github.com/Ahmet-Dedeler/bcpack-rs", rev = "61ea9b2a2699625911cddcb44998ae32da05abfe", default-features = false, features = ["ttpf"] }
+bcpack-rs = { git = "https://github.com/Ahmet-Dedeler/bcpack-rs", rev = "c55c5fad539644b8cf5a705051df214291763fc0", default-features = false, features = ["ttpf"] }
+bcdec_rs = "0.2.1"

@@ -13,7 +13,7 @@ RPF9 is a container format used by a well-known retail game engine. This tool ha
 - **Tree / search** nested RPF9 archives by magic, extension, size or content
 - **Replace / repack** entries in place or at any size, re-encrypting the TOC
 - **Decode payloads**: AWC audio streams, SGD5 shader databases, Bink 2 video headers, PSIN game data, paged resources
-- **Textures**: list RDS5 (`.ttpf`) stores and decode BCPack BC1 to DDS or PNG (fitted endpoint tables; output is approximate, see [bcpack-rs#4](https://github.com/Ahmet-Dedeler/bcpack-rs/issues/4))
+- **Textures**: list RDS5 (`.ttpf`) stores and decode BCPack BC1 to DDS or PNG (fitted endpoint tables; output is approximate, see [bcpack-rs#4](https://github.com/Ahmet-Dedeler/bcpack-rs/issues/4)), and BCPack BC3/BC5/BC7 to DDS (DX10) or PNG, including array slices (bcpack-rs `bc5-bc7` branch; checked against the stored mip pyramid on all 129 BC3/BC5/BC7 chunks we have)
 - **Mod packs**: a TOML manifest of entry replacements, verified and applied in one command
 - **Hexdump** individual entries for analysis
 - **JSON output** for integration with other tools
@@ -84,8 +84,9 @@ forge9 resource archive.rpf 7
 
 # Texture stores (.ttpf files sit next to the archives, not inside them)
 forge9 texture store.ttpf                       # list: size, format, mips, tile mode, hash
-forge9 texture store.ttpf --extract 12 -o a.dds # BC1 mip 0 as DDS
-forge9 texture store.ttpf --decode 12 -o a.png  # BC1 mip 0 as PNG
+forge9 texture store.ttpf --extract 12 -o a.dds # BC1/BC3/BC5/BC7 mip 0 as DDS
+forge9 texture store.ttpf --decode 12 -o a.png  # mip 0 as PNG (BC5 as red/green)
+forge9 texture store.ttpf --decode 300 --slice 5 # one slice of an array texture
 forge9 bcpack-analyze store.ttpf --codec bc7     # BC3/BC5/BC7 entropy stage: fragments, lane stats
 forge9 bcpack-analyze store.ttpf 119 -o l.bin    # one chunk; lane symbol streams as u16 LE
 
@@ -136,7 +137,7 @@ given (uncompressed); readers detect zlib per entry, so plain payloads read back
 | Pipeline cache | `PS 00 09` | `pipelines` | Header, graphics/compute PSO records, shader slots, metadata and code ranges |
 | Bink 2 video | `KB2?` | `bink` | Header: size, frames, dimensions, frame rate |
 | Paged resource | `0DRP` | `resource` | Kind detection, virtual/physical pointer resolution |
-| RDS5 texture store | `RDS5` | `texture` | Chunk table, ETPF index; BCPack BC1 decode to DDS/PNG (mip 0, fitted tables — endpoints approximate) |
+| RDS5 texture store | `RDS5` | `texture` | Chunk table, ETPF index; mip 0 to DDS/PNG: BCPack BC1 (fitted tables — endpoints approximate), BCPack BC3/BC5/BC7 and plain BC3/BC5/BC7 (tile modes 0-3) |
 | XML, DDS, PNG, GFX, RBF | various | `list` | Detected only |
 
 ## Architecture
@@ -198,7 +199,8 @@ cargo build --release
 - [ ] Name recovery from larger hash dictionaries
 - [ ] PSIN binary-XML editor (read-modify-write values)
 - [x] BCPack BC1 texture decoding
-- [ ] BCPack BC7 and full mip chains
+- [x] BCPack BC3/BC5/BC7 texture decoding (mip 0, array slices)
+- [ ] Full mip chains and cube maps (tile modes 9/10)
 - [ ] Model export (glTF) from paged resources
 - [ ] Pipeline cache (PS09) parsing
 - [ ] Streaming world analysis tools
@@ -210,9 +212,11 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) and the
 
 ## Credits
 
-BCPack BC1 decoding, RDS5 parsing and Gfx10 detiling come from
+BCPack decoding (BC1, and BC3/BC5/BC7 from its `bc5-bc7` branch, pinned by commit), RDS5 parsing
+and BC1 Gfx10 detiling come from
 [bcpack-rs](https://github.com/Ahmet-Dedeler/bcpack-rs) by Ahmet Dedeler (MIT OR Apache-2.0), whose
 rANS tables derive from Microsoft's MIT-licensed [silicon-rans](https://github.com/microsoft/silicon-rans).
+BC3/BC5/BC7 pixels for PNG output come from [bcdec_rs](https://crates.io/crates/bcdec_rs).
 
 ## License
 
