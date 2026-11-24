@@ -84,6 +84,58 @@ pub fn detect(plain: &[u8], file_len: u64, declared: usize) -> (usize, usize) {
     best
 }
 
+/// Directory hash of the 20-byte entry section that content archives (e.g. the
+/// nested RPF9s of story/level packs) carry instead of the 24-byte one:
+/// `{u32 size_hint, u32 flags, u32 size/16, u32 offset/16, u32 aux}`.
+/// Each payload starts with 16 zero bytes, which are not part of the entry.
+const COMPACT_SECTION: [u8; 8] = 0xba18_0afb_232d_1b4bu64.to_le_bytes();
+const COMPACT_RECORD: usize = 20;
+const COMPACT_PREFIX: u64 = 16;
+
+/// Finds the compact entry table: `(start, count)` of the first 8-aligned run
+/// of `count` records after the section's directory descriptor whose payloads
+/// lie in `data` past `data_start` behind the zero prefix.
+pub fn detect_compact(plain: &[u8], data: &[u8], data_start: u64) -> Option<(usize, usize)> {
+    let dir = plain.windows(8).position(|w| w == COMPACT_SECTION)?;
+    let count = u32::from_le_bytes(plain.get(dir + 8..dir + 12)?.try_into().unwrap()) as usize;
+    let valid = |at: usize| {
+        let (_, blocks, units) = compact_fields(&plain[at..at + COMPACT_RECORD]);
+        let (start, end) = (units * 16, (units + blocks) * 16);
+        blocks > 1 && start >= data_start && end <= data.len() as u64
+            && data[start as usize..(start + COMPACT_PREFIX) as usize].iter().all(|&b| b == 0)
+    };
+    ((dir + 24).next_multiple_of(8)..)
+        .step_by(8)
+        .take_while(|&s| s + count * COMPACT_RECORD <= plain.len())
+        .find(|&s| (0..count).all(|i| valid(s + i * COMPACT_RECORD)))
+        .map(|s| (s, count))
+}
+
+fn compact_fields(bytes: &[u8]) -> ([u32; 5], u64, u64) {
+    let w: [u32; 5] = std::array::from_fn(|i| u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap()));
+    (w, u64::from(w[2]), u64::from(w[3]))
+}
+
+pub fn parse_compact(plain: &[u8], table_at: usize, count: usize) -> Vec<Entry> {
+    (0..count)
+        .map(|index| {
+            let at = table_at + index * COMPACT_RECORD;
+            let (w, blocks, units) = compact_fields(&plain[at..at + COMPACT_RECORD]);
+            let mut raw = [0u8; RECORD];
+            raw[..COMPACT_RECORD].copy_from_slice(&plain[at..at + COMPACT_RECORD]);
+            Entry {
+                index,
+                offset: units * 16 + COMPACT_PREFIX,
+                size: blocks * 16 - COMPACT_PREFIX,
+                size_hint: w[0],
+                aux: w[4],
+                flags: w[1],
+                raw,
+            }
+        })
+        .collect()
+}
+
 pub fn parse(plain: &[u8], table_at: usize, run: usize, count: usize, end: u64) -> Vec<Entry> {
     let count = count.min(run);
     let mut entries = Vec::with_capacity(count);
@@ -156,6 +208,24 @@ mod tests {
         let entries = parse(&plain, 0, 2, 2, 0x2270);
         assert_eq!((entries[0].offset, entries[0].size), (0x360, 0xca0));
         assert_eq!((entries[1].offset, entries[1].size), (0x1000, 0x1270));
+    }
+
+    #[test]
+    fn compact_layout_from_directory() {
+        // story000_restofworld.rpf nested #19: directory descriptor, padding, one record
+        let mut plain = vec![0u8; 0x60];
+        plain[0..8].copy_from_slice(&COMPACT_SECTION);
+        plain[8..12].copy_from_slice(&1u32.to_le_bytes());
+        for (i, w) in [0x201bu32, 0xe601, 0xb5e, 0x100, 4].iter().enumerate() {
+            plain[0x30 + i * 4..0x34 + i * 4].copy_from_slice(&w.to_le_bytes());
+        }
+        let mut data = vec![0u8; 0xd000];
+        assert_eq!(detect_compact(&plain, &data, 0x2b0), Some((0x30, 1)));
+        data[0x1008] = 1; // zero prefix broken
+        assert_eq!(detect_compact(&plain, &data, 0x2b0), None);
+        assert_eq!(detect_compact(&plain, &data[..0xc000], 0x2b0), None);
+        let entries = parse_compact(&plain, 0x30, 1);
+        assert_eq!((entries[0].offset, entries[0].size, entries[0].aux), (0x1010, 0xb5d0, 4));
     }
 
     #[test]

@@ -11,7 +11,6 @@
 use anyhow::{bail, Context, Result};
 use std::path::Path;
 
-pub const KEY_COUNT: usize = 9;
 const STATE_SIZE: usize = 0x10F0;
 const KEY_BLOB_SIZE: usize = 0x10F4;
 const TABLES_SIZE: usize = 0x5000;
@@ -158,22 +157,28 @@ impl CryptoContext {
         if tables.len() != TABLES_SIZE {
             bail!("tables.bin: expected {TABLES_SIZE} bytes, got {}", tables.len());
         }
-        if keys.len() != KEY_COUNT * KEY_BLOB_SIZE {
-            bail!("keys.bin: expected {} bytes, got {}", KEY_COUNT * KEY_BLOB_SIZE, keys.len());
+        if keys.is_empty() || keys.len() % KEY_BLOB_SIZE != 0 {
+            bail!("keys.bin: expected a non-empty multiple of {KEY_BLOB_SIZE} bytes, got {}", keys.len());
+        }
+        if let Some(index) = keys.chunks(KEY_BLOB_SIZE).position(|blob| blob[..4] != KEY_MAGIC) {
+            bail!("keys.bin: key {index} is not in the {KEY_MAGIC:02x?} family");
         }
         let inverse = InverseRound::build(&tables)?;
         Ok(Self { tables, keys, inverse })
     }
 
+    /// Number of key blobs in keys.bin.
+    pub fn key_count(&self) -> usize {
+        self.keys.len() / KEY_BLOB_SIZE
+    }
+
     pub fn schedule(&self, index: usize) -> Result<KeySchedule<'_>> {
-        if index >= KEY_COUNT {
-            bail!("key index {index} out of range (0..{KEY_COUNT})");
+        let count = self.key_count();
+        if index >= count {
+            bail!("key index {index} out of range (0..{count})");
         }
         let at = index * KEY_BLOB_SIZE;
         let blob = &self.keys[at..at + KEY_BLOB_SIZE];
-        if blob[..4] != KEY_MAGIC {
-            bail!("key {index}: bad magic");
-        }
         let mut round_keys = [0u32; 60];
         for (i, key) in round_keys.iter_mut().enumerate() {
             let o = 4 + i * 4;
@@ -370,7 +375,7 @@ mod tests {
     fn block_roundtrip_all_keys() {
         let Some(crypto) = context() else { return; };
         let mut seed = 0x1234_5678u32;
-        for index in 0..KEY_COUNT {
+        for index in 0..crypto.key_count() {
             let schedule = crypto.schedule(index).unwrap();
             for _ in 0..64 {
                 let mut plain = [0u8; 16];

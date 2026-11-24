@@ -1,7 +1,7 @@
 //! High-level RPF9 archive reader with automatic key discovery.
 
 use anyhow::{bail, Result};
-use crate::rpf9::crypto::{CryptoContext, TAG_IV, KEY_COUNT};
+use crate::rpf9::crypto::{CryptoContext, TAG_IV};
 use crate::rpf9::entry::{self, Entry};
 use crate::rpf9::header::{Header, HEADER_SIZE};
 
@@ -22,25 +22,35 @@ impl<'a> Archive<'a> {
         let ciphertext = &data[HEADER_SIZE..end];
         let declared = header.entry_count as usize;
 
-        let mut best: Option<(usize, usize, Vec<u8>)> = None;
+        let mut best: Option<(usize, usize, Vec<u8>, bool)> = None;
         let mut best_key = 0;
-        for index in 0..KEY_COUNT {
+        for index in 0..crypto.key_count() {
             let schedule = crypto.schedule(index)?;
             let mut plain = ciphertext.to_vec();
             schedule.decrypt_cbc(&mut plain, &TAG_IV);
-            let (start, run) = entry::detect(&plain, data.len() as u64, declared);
+            let (mut start, mut run) = entry::detect(&plain, data.len() as u64, declared);
+            let mut compact = false;
+            if run < declared {
+                if let Some((s, r)) = entry::detect_compact(&plain, data, end as u64) {
+                    if r > run { (start, run, compact) = (s, r, true); }
+                }
+            }
             let replace = match &best {
                 None => true,
                 Some((best_run, ..)) => run > *best_run,
             };
             if replace {
-                best = Some((run, start, plain));
+                best = Some((run, start, plain, compact));
                 best_key = index;
             }
         }
-        let (run, start, plain) = best.expect("at least one key exists");
+        let (run, start, plain, compact) = best.expect("at least one key exists");
         if run == 0 && declared > 0 {
             bail!("no table records recovered with any key");
+        }
+        if compact {
+            let entries = entry::parse_compact(&plain, start, run);
+            return Ok(Self { data, header, entries, key_index: best_key });
         }
         let skip = if declared > 0 && run == declared + 1 { 1 } else { 0 };
         let count = if declared == 0 { run } else { declared.min(run) };
