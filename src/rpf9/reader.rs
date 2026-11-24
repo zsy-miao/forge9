@@ -1,7 +1,7 @@
 //! High-level RPF9 archive reader with automatic key discovery.
 
 use anyhow::{bail, Result};
-use crate::rpf9::crypto::{CryptoContext, TAG_IV, KEY_COUNT};
+use crate::rpf9::crypto::{CryptoContext, TAG_IV};
 use crate::rpf9::entry::{self, Entry};
 use crate::rpf9::header::{Header, HEADER_SIZE};
 
@@ -24,7 +24,7 @@ impl<'a> Archive<'a> {
 
         let mut best: Option<(usize, usize, Vec<u8>)> = None;
         let mut best_key = 0;
-        for index in 0..KEY_COUNT {
+        for index in 0..crypto.key_count() {
             let schedule = crypto.schedule(index)?;
             let mut plain = ciphertext.to_vec();
             schedule.decrypt_cbc(&mut plain, &TAG_IV);
