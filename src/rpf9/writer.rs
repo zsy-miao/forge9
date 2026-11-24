@@ -122,6 +122,12 @@ pub fn repack(
     let mut toc_plain = original_toc_cipher.to_vec();
     schedule.decrypt_cbc(&mut toc_plain, &TAG_IV);
 
+    for (&idx, data) in replacements {
+        if data.is_empty() {
+            bail!("replacement for entry #{idx} is empty (0 bytes) — this would produce an unreadable record");
+        }
+    }
+
     let entries = archive.entries();
     let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(entries.len());
     for entry in entries {
