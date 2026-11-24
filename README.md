@@ -86,6 +86,8 @@ forge9 resource archive.rpf 7
 forge9 texture store.ttpf                       # list: size, format, mips, tile mode, hash
 forge9 texture store.ttpf --extract 12 -o a.dds # BC1 mip 0 as DDS
 forge9 texture store.ttpf --decode 12 -o a.png  # BC1 mip 0 as PNG
+forge9 bcpack-analyze store.ttpf --codec bc7     # BC3/BC5/BC7 entropy stage: fragments, lane stats
+forge9 bcpack-analyze store.ttpf 119 -o l.bin    # one chunk; lane symbol streams as u16 LE
 
 # joaat hash of a name
 forge9 hash player_one

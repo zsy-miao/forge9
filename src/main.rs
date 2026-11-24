@@ -176,6 +176,22 @@ enum Command {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+    /// Entropy-stage analysis of BCPack BC3/BC5/BC6H/BC7 chunks: fragment headers, lane symbol stats
+    BcpackAnalyze {
+        store: PathBuf,
+        /// Chunk index (see `--codec` output for the chunks of a codec)
+        #[arg(required_unless_present = "codec", conflicts_with = "codec")]
+        chunk: Option<usize>,
+        /// Aggregate over every chunk of this codec: bc3, bc5, bc6h, bc7
+        #[arg(long)]
+        codec: Option<String>,
+        /// Write the chunk's lane symbol streams here (u16 LE, lane major)
+        #[arg(short, long, requires = "chunk")]
+        output: Option<PathBuf>,
+        /// Override the lane symbol widths, e.g. `4,4,8,8,6,6,6,6,6,6,6,6`
+        #[arg(long, value_delimiter = ',')]
+        widths: Option<Vec<u8>>,
+    },
     /// Create, verify and apply mod packs
     #[command(subcommand)]
     Mod(ModCommand),
@@ -232,6 +248,9 @@ fn main() -> Result<()> {
     if let Command::Texture { store, extract, decode, output } = &cli.command {
         return cmd_texture(store, *extract, *decode, output.clone());
     }
+    if let Command::BcpackAnalyze { store, chunk, codec, output, widths } = &cli.command {
+        return cmd_bcpack_analyze(store, *chunk, codec.as_deref(), output.as_deref(), widths.as_deref());
+    }
     let crypto = rpf9::crypto::CryptoContext::load(&cli.data_dir)
         .context("loading crypto data — set FORGE9_DATA or --data-dir")?;
 
@@ -262,7 +281,7 @@ fn main() -> Result<()> {
             let m = modding::manifest::Manifest::load(&manifest)?;
             modding::apply::apply(&m, archive.as_deref(), &crypto, &output)
         }
-        Command::Hash { .. } | Command::Texture { .. } | Command::Mod(_) => unreachable!(),
+        Command::Hash { .. } | Command::Texture { .. } | Command::BcpackAnalyze { .. } | Command::Mod(_) => unreachable!(),
     }
 }
 
@@ -764,5 +783,143 @@ fn cmd_isa(bytes: &[u8], summary: bool, shader: Option<usize>) -> Result<()> {
         let cols: String = names.iter().map(|s| format!(" {s}={}", by.get(s).copied().unwrap_or(0))).collect();
         println!("  {:>6}  {g}:{cols}", by.values().sum::<u64>());
     }
+    Ok(())
+}
+
+fn cmd_bcpack_analyze(path: &PathBuf, chunk: Option<usize>, codec: Option<&str>, output: Option<&std::path::Path>, widths_override: Option<&[u8]>) -> Result<()> {
+    use formats::{bcpack_analyze as ba, texture};
+    let store = texture::Store::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let syms_of = |c: &texture::Store, i: usize| (c.chunks[i].vlen / ba::SYMBOL_BYTES) as usize;
+    if let Some(i) = chunk {
+        let c = store.chunks.get(i).ok_or_else(|| anyhow::anyhow!("chunk {i} out of range ({} chunks)", store.chunks.len()))?;
+        let widths = widths_override.or(ba::lane_widths(c.codec)).ok_or_else(|| anyhow::anyhow!("chunk {i} is {}, not BC3/BC5/BC6H/BC7 BCPack", texture::codec_name(c.codec)))?;
+        let data = store.chunk_bytes(i, false)?;
+        let n = syms_of(&store, i);
+        println!("chunk {i}: {}  file {:#x}+{:#x} (pad {})  virtual {:#x}+{:#x}  {} blocks, {n} symbols/lane, {:.2} bytes/block",
+            texture::codec_name(c.codec), c.file_off, c.file_len, c.pad, c.vstart, c.vlen, n / 2, data.len() as f64 / (n / 2) as f64);
+        for t in store.textures()?.iter().filter(|t| (c.vstart..c.vstart + c.vlen).contains(&t.vstart)) {
+            println!("  texture #{} {}x{} {} mips {} starts here", t.index, t.width, t.height, texture::dxgi_name(t.dxgi), t.mips);
+        }
+        let a = ba::analyze(data, widths, n).map_err(|e| anyhow::anyhow!("entropy stage failed: {e}"))?;
+        println!("  converged in {} cycles: {} of {} bytes consumed, tail {}", a.cycles, a.consumed, a.stream_len, if a.tail_zero { "zero" } else { "NOT zero" });
+        println!("  lane width   bytes frags  end-state     hdr  bits/sym entropy  zero%  distinct  max  q-models          z   flush 3B  payload min..max  top symbols");
+        for (k, l) in a.lanes.iter().enumerate() {
+            let state = if l.final_state == bcpack::rans::L { "L" } else if l.final_state == bcpack::rans::L >> 8 { "L>>8" } else { "L>>16" };
+            let mut qs: Vec<u8> = l.fragments.iter().map(|f| f.q).collect(); qs.sort(); qs.dedup();
+            let mut zs: Vec<u8> = l.fragments.iter().map(|f| f.z).collect(); zs.sort(); zs.dedup();
+            let pay = l.fragments.iter().map(|f| f.payload);
+            let mut top: Vec<(usize, u64)> = l.hist.iter().copied().enumerate().filter(|x| x.1 > 0).collect();
+            top.sort_by(|x, y| y.1.cmp(&x.1));
+            let top: Vec<String> = top.iter().take(5).map(|(v, k)| format!("{v}:{k}")).collect();
+            println!("  {k:>4} {:>5} {:>7} {:>5}  {state:<12}  {:<4} {:>7.3} {:>7.3} {:>6.1} {:>8} {:>4}  {:<17} {:<3} {:>4} {:>3}  {:>5}..{:<6}      {}",
+                l.width, l.bytes, l.fragments.len(), if l.headers_consistent() { "ok" } else { "BAD" }, l.coded_bits(), l.entropy(),
+                100.0 * l.hist[0] as f64 / n as f64, l.distinct(), l.max_symbol().unwrap_or(0), format!("{qs:?}"), format!("{zs:?}"),
+                l.fragments.iter().filter(|f| f.flush).count(), l.fragments.iter().filter(|f| f.three_byte).count(),
+                pay.clone().min().unwrap_or(0), pay.max().unwrap_or(0), top.join(" "));
+        }
+        if let Some(out) = output {
+            let bytes: Vec<u8> = a.symbols.iter().flatten().flat_map(|s| s.to_le_bytes()).collect();
+            std::fs::write(out, bytes)?;
+            println!("  {} lanes x {n} symbols (u16 LE, lane major) → {}", a.lanes.len(), out.display());
+        }
+        return Ok(());
+    }
+    let code = match codec.unwrap_or_default().to_ascii_lowercase().as_str() {
+        "bc3" => 0x0C, "bc5" => 0x14, "bc6h" => 0x18, "bc7" => 0x1C,
+        other => anyhow::bail!("unknown codec {other:?} (bc3, bc5, bc6h, bc7)"),
+    };
+    let widths = widths_override.unwrap_or(ba::lane_widths(code).unwrap());
+    if widths.is_empty() || widths.len() > 16 || widths.iter().any(|w| !(1..=9).contains(w)) { anyhow::bail!("need 1..=16 widths of 1..=9 bits"); }
+    let idx: Vec<usize> = store.chunks.iter().filter(|c| c.codec == code).map(|c| c.index).collect();
+    println!("{}: {} {} chunks", path.display(), idx.len(), texture::codec_name(code));
+    if idx.is_empty() { return Ok(()); }
+    let mut ok = Vec::new();
+    for &i in &idx {
+        match ba::analyze(store.chunk_bytes(i, false)?, widths, syms_of(&store, i)) {
+            Ok(a) => ok.push((i, a)),
+            Err(e) => println!("  chunk {i}: entropy stage failed ({} stored bytes): {e}", store.chunks[i].data_len()),
+        }
+    }
+    let mut blocks: Vec<usize> = idx.iter().map(|&i| syms_of(&store, i) / 2).collect();
+    blocks.sort();
+    let stored: u64 = idx.iter().map(|&i| store.chunks[i].data_len()).sum();
+    let total_blocks: usize = blocks.iter().sum();
+    println!("  blocks per chunk {}..{} (median {}), {total_blocks} blocks, {stored} stored bytes = {:.2} bytes/block ({:.1}% of raw)",
+        blocks[0], blocks[blocks.len() - 1], blocks[blocks.len() / 2], stored as f64 / total_blocks as f64, 100.0 * stored as f64 / (16 * total_blocks) as f64);
+    let lane_count = widths.len();
+    let all_lanes = || ok.iter().flat_map(|(_, a)| a.lanes.iter());
+    let legal = all_lanes().filter(|l| bcpack::rans::is_legal_end_state(l.final_state)).count();
+    let exact = ok.iter().filter(|(_, a)| a.consumed == a.stream_len).count();
+    let tail = ok.iter().filter(|(_, a)| a.tail_zero).count();
+    println!("  entropy stage: {}/{} chunks converge; {legal}/{} lanes end in a legal state; consumed == stored-pad in {exact}, zero tail in {tail}",
+        ok.len(), idx.len(), ok.len() * lane_count);
+    let ends = |s: u32| all_lanes().filter(|l| l.final_state == s).count();
+    println!("    end states: L {}, L>>8 {}, L>>16 {}", ends(bcpack::rans::L), ends(bcpack::rans::L >> 8), ends(bcpack::rans::L >> 16));
+    let frags: Vec<&ba::Fragment> = all_lanes().flat_map(|l| l.fragments.iter()).collect();
+    let consistent = all_lanes().filter(|l| l.headers_consistent()).count();
+    let mut pay: Vec<u32> = frags.iter().map(|f| f.payload).collect();
+    pay.sort();
+    let count = |f: &dyn Fn(&&ba::Fragment) -> bool| frags.iter().filter(|x| f(x)).count();
+    println!("  fragment headers: {} fragments, header+payload == lane bytes and count == decoder count in {consistent}/{} lanes",
+        frags.len(), ok.len() * lane_count);
+    if !pay.is_empty() {
+        println!("    three-byte {}, flush {}, payload {}..{} (median {})", count(&|f| f.three_byte), count(&|f| f.flush), pay[0], pay[pay.len() - 1], pay[pay.len() / 2]);
+    }
+    let qd: Vec<String> = (0..16).map(|q| count(&|f| f.q == q)).enumerate().filter(|x| x.1 > 0).map(|(q, n)| format!("q{q}:{n}")).collect();
+    let zd: Vec<String> = (0..4).map(|z| count(&|f| f.z == z)).enumerate().filter(|x| x.1 > 0).map(|(z, n)| format!("z{z}:{n}")).collect();
+    println!("    models {}  narrowing {}", qd.join(" "), zd.join(" "));
+    println!("  lane width frags  bits/sym entropy  zero% even/odd  distinct even/odd  max  chunks-constant  MI(2i,2i+1) MI(2i+1,2i+2)");
+    for n in 0..lane_count {
+        let w = widths[n];
+        let (mut he, mut ho) = (vec![0u64; 1 << w], vec![0u64; 1 << w]);
+        let (mut bytes, mut nf, mut constant) = (0u64, 0usize, 0usize);
+        let (mut pair, mut cross) = (ba::Joint::new(w, w), ba::Joint::new(w, w));
+        for (_, a) in &ok {
+            let l = &a.lanes[n];
+            let (e, o) = ba::halves(&a.symbols[n]);
+            for &x in &e { he[x as usize] += 1; }
+            for &x in &o { ho[x as usize] += 1; }
+            pair.add(&e, &o);
+            cross.add(&o, &e[1..]);
+            bytes += l.bytes as u64;
+            nf += l.fragments.len();
+            constant += (l.distinct() == 1) as usize;
+        }
+        let hist = he.iter().zip(&ho).map(|(x, y)| x + y).collect();
+        let l = ba::Lane { width: w, bytes: bytes as u32, hist, ..Default::default() };
+        let pct = |h: &[u64]| 100.0 * h[0] as f64 / h.iter().sum::<u64>().max(1) as f64;
+        let distinct = |h: &[u64]| h.iter().filter(|&&x| x > 0).count();
+        println!("  {n:>4} {w:>5} {nf:>5}  {:>7.3} {:>7.3}   {:>5.1}/{:<5.1}       {:>3}/{:<3}       {:>4}  {constant:>3}/{:<3}          {:>6.3}      {:>6.3}",
+            l.coded_bits(), l.entropy(), pct(&he), pct(&ho), distinct(&he), distinct(&ho), l.max_symbol().unwrap_or(0), ok.len(), pair.mi(), cross.mi());
+    }
+    println!("  mutual information between lanes of the same symbol vector (bits):");
+    println!("       {}", (0..lane_count).map(|b| format!("{b:>5}")).collect::<String>());
+    for x in 0..lane_count {
+        let row: String = (0..lane_count).map(|y| {
+            if x == y { return "    -".into(); }
+            let mut j = ba::Joint::new(widths[x], widths[y]);
+            for (_, a) in &ok { j.add(&a.symbols[x], &a.symbols[y]); }
+            format!("{:>5.2}", j.mi())
+        }).collect();
+        println!("  {x:>4} {row}");
+    }
+    // Every lane width and the block count are load-bearing: change one and the chunks stop converging.
+    println!("  perturbation (chunks still converging, of {}):", ok.len());
+    let conv = |w: &[u8], db: isize| ok.iter().filter(|(i, a)| ba::converges(store.chunk_bytes(*i, false).unwrap(), w, a.symbols_per_lane.saturating_add_signed(db))).count();
+    let one_per_block = ok.iter().filter(|(i, a)| ba::converges(store.chunk_bytes(*i, false).unwrap(), widths, a.symbols_per_lane / 2)).count();
+    println!("    symbols/lane -1: {}  +1: {}  one per block (virtual/16): {one_per_block}", conv(widths, -1), conv(widths, 1));
+    let mut line = Vec::new();
+    for n in 0..lane_count {
+        let mut r = Vec::new();
+        for d in [-1i8, 1] {
+            let w = widths[n] as i8 + d;
+            if !(1..=9).contains(&w) { r.push("-".to_string()); continue; }
+            let mut ws = widths.to_vec();
+            ws[n] = w as u8;
+            r.push(conv(&ws, 0).to_string());
+        }
+        line.push(format!("lane{n} {}", r.join("/")));
+    }
+    println!("    width -1/+1: {}", line.join("  "));
     Ok(())
 }

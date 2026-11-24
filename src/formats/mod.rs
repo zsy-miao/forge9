@@ -1,6 +1,7 @@
 //! Decoders for payload formats found inside RPF9 archives.
 
 pub mod awc;
+pub mod bcpack_analyze;
 pub mod bink;
 pub mod fssm;
 pub mod ps09;
