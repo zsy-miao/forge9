@@ -1,8 +1,9 @@
 //! RDNA2 (GFX10.3) instruction-length decoder and classifier.
 //!
-//! Not a disassembler: it walks a program's dwords, sizes each instruction
+//! It walks a program's dwords, sizes each instruction
 //! (base encoding + literal / DPP / SDWA / MIMG NSA dwords) and tags it with
 //! its encoding family, opcode and, where it has one, a wave64-sensitive op class.
+//! [`super::rdna2_disasm`] turns the sized instructions into text.
 //!
 //! Encodings are picked by the top bits of the first dword:
 //!
@@ -342,8 +343,10 @@ const S_CODE_END: u32 = 0xBF9F_0000;
 /// Decodes every instruction reachable from offset 0, following branches;
 /// paths end at `s_endpgm`, `s_branch`, `s_setpc_b64`, `s_code_end` or an
 /// unknown encoding. Unreached dwords are data, not code.
-pub fn analyze(code: &[u8]) -> Stats {
-    // Per dword: 0 unvisited, 1 instruction start, 2 inside an instruction.
+pub fn analyze(code: &[u8]) -> Stats { analyze_marks(code).0 }
+
+/// [`analyze`], plus a mark per dword: 0 unreached (data), 1 instruction start, 2 inside an instruction.
+pub fn analyze_marks(code: &[u8]) -> (Stats, Vec<u8>) {
     let mut mark = vec![0u8; code.len() / 4];
     let mut s = Stats::default();
     let mut todo = vec![0usize];
@@ -383,7 +386,7 @@ pub fn analyze(code: &[u8]) -> Stats {
     }
     s.data_dwords = code.chunks_exact(4).zip(&mark)
         .filter(|(w, m)| **m == 0 && u32::from_le_bytes((*w).try_into().unwrap()) != S_CODE_END).count() as u32;
-    s
+    (s, mark)
 }
 
 #[cfg(test)]

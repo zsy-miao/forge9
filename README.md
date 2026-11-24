@@ -73,6 +73,11 @@ forge9 isa shaders.rpf 0 --shader 594      # full family breakdown of one record
 forge9 isa shaders.rpf 0 --opcodes         # opcode census (add --stage MS for one stage)
 forge9 isa shaders.rpf 0 --shader 594 --dump out  # raw code → out.<n>.<stage>.bin
 
+# Full disassembly of one record's programs, LLVM (llvm-mc -mcpu=gfx1030) syntax;
+# branch targets are byte offsets, unreached dwords print as `.long ... ; unreached`
+forge9 disasm shaders.rpf 2 --shader 1
+forge9 disasm shaders.rpf 0 --shader 594 --raw   # with each instruction's dwords
+
 # Driver pipeline cache (PS09): graphics/compute PSOs and their shader slots
 forge9 pipelines shaders.rpf 1
 forge9 pipelines shaders.rpf 1 --mesh      # only PSOs with a mesh (NGG) shader
@@ -135,7 +140,7 @@ given (uncompressed); readers detect zlib per entry, so plain payloads read back
 | AWC audio | `ADAT` | `awc` | Stream table, chunks, formats (Opus, XMA2, PCM); no decode |
 | SGD5 shader database | `SGD5` | `shaders` | Record names, stages, tags, sizes; DXBC payload offsets |
 | Xbox shader program | `XBCH` → `FSSM` | `fssm` | XDAT section 0x0D inflated; stages, root layout, used resources |
-| RDNA2 machine code | (FSSM code range) | `isa` | Length decode by control flow, encoding families, opcodes, wave64-sensitive ops; see [docs/wave64_instruction_usage.md](docs/wave64_instruction_usage.md), [docs/rdna2_opcode_coverage.md](docs/rdna2_opcode_coverage.md) |
+| RDNA2 machine code | (FSSM code range) | `isa`, `disasm` | Length decode by control flow, encoding families, opcodes, wave64-sensitive ops; full disassembly with operands (matches llvm-mc on a 3.47M-instruction sample); see [docs/wave64_instruction_usage.md](docs/wave64_instruction_usage.md), [docs/rdna2_opcode_coverage.md](docs/rdna2_opcode_coverage.md) |
 | Pipeline cache | `PS 00 09` | `pipelines` | Header, graphics/compute PSO records, shader slots, metadata and code ranges |
 | Bink 2 video | `KB2?` | `bink` | Header: size, frames, dimensions, frame rate |
 | Paged resource | `0DRP` | `resource` | Kind detection, virtual/physical pointer resolution |
