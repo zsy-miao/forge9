@@ -11,6 +11,7 @@ mod rdna2_ops;
 pub mod resource;
 pub mod sgd5;
 pub mod texture;
+pub mod uniformity;
 pub mod xbch;
 
 pub(crate) fn u16_at(data: &[u8], at: usize) -> Option<u16> {
