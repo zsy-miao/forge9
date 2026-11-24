@@ -111,7 +111,7 @@ for n in json.load(sys.stdin):
   fi
 
   # Track replies on threads we contributed to
-  for pr in "zeozeozeo/rpf9/2" "Ahmet-Dedeler/awesome-gta6-reverse-engineering/17" "omonkeyz/xbox-emulator/142" "Marvisak/VIctory/614" "ivall/xcl/878" "Ahmet-Dedeler/bcpack-rs/4"; do
+  for pr in "zeozeozeo/rpf9/2" "Ahmet-Dedeler/awesome-gta6-reverse-engineering/17" "omonkeyz/xbox-emulator/142" "Marvisak/VIctory/614" "ivall/xcl/878" "Ahmet-Dedeler/bcpack-rs/4" "ivall/xcl/772" "Ahmet-Dedeler/bcpack-rs/5"; do
     repo="${pr%/*}"; num="${pr##*/}"
     pr_file="${STATE_DIR}/thread_${repo//\//_}_${num}.count"
     cur=$(curl -s -H "Authorization: token $GH_TOKEN" "https://api.github.com/repos/$repo/issues/$num/comments?per_page=100" 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print(len(d) if isinstance(d,list) else 0)" 2>/dev/null || echo 0)
