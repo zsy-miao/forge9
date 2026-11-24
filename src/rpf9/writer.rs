@@ -166,6 +166,9 @@ pub fn repack(
     let (entry_start, run) = crate::rpf9::entry::detect(
         &toc_plain, archive_total, header.entry_count as usize,
     );
+    if run < entries.len() {
+        bail!("TOC layout has no 24-byte entry records to rewrite (compact content archive?) — repack unsupported");
+    }
     let skip = if header.entry_count > 0 && run == header.entry_count as usize + 1 { 1 } else { 0 };
 
     for (i, _entry) in entries.iter().enumerate() {
