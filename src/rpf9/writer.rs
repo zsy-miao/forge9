@@ -140,22 +140,29 @@ pub fn repack(
         }
     }
 
-    let data_start = (toc_end + 0xFFF) & !0xFFF;
+    // Lay payloads out in their original physical order, so multi-page zlib
+    // streams stay adjacent and an unchanged archive repacks byte-identically.
+    // `data_region` holds the bytes from `toc_end` on.
+    let mut order: Vec<usize> = (0..entries.len()).collect();
+    order.sort_by_key(|&i| entries[i].offset);
     let mut data_region = Vec::new();
-    let mut new_offsets: Vec<u64> = Vec::with_capacity(entries.len());
-    let mut new_sizes: Vec<u64> = Vec::with_capacity(entries.len());
+    let mut new_offsets = vec![0u64; entries.len()];
+    let mut new_sizes = vec![0u64; entries.len()];
 
-    for payload in &payloads {
-        let offset = data_start as u64 + data_region.len() as u64;
-        new_offsets.push(offset);
-        new_sizes.push(payload.len() as u64);
-        data_region.extend_from_slice(payload);
+    for &i in &order {
+        // ponytail: alignment inferred from the original offset, capped at 4 KiB; the real rule is unknown
+        let align = 1usize << entries[i].offset.trailing_zeros().min(12);
+        let pos = (toc_end + data_region.len()).next_multiple_of(align);
+        data_region.resize(pos - toc_end, 0);
+        new_offsets[i] = pos as u64;
+        new_sizes[i] = payloads[i].len() as u64;
+        data_region.extend_from_slice(&payloads[i]);
         let pad = (16 - (data_region.len() % 16)) % 16;
         data_region.resize(data_region.len() + pad, 0);
     }
 
     // Rebuild 24-byte entry records in plaintext TOC
-    let archive_total = data_start as u64 + data_region.len() as u64 + header.trailer_size as u64;
+    let archive_total = toc_end as u64 + data_region.len() as u64 + header.trailer_size as u64;
     let (entry_start, run) = crate::rpf9::entry::detect(
         &toc_plain, archive_total, header.entry_count as usize,
     );
@@ -177,10 +184,9 @@ pub fn repack(
     let trailer_start = original.len() - header.trailer_size as usize;
     let trailer = &original[trailer_start..];
 
-    let mut out = Vec::with_capacity(data_start + data_region.len() + trailer.len());
-    out.extend_from_slice(&header.to_bytes());
+    let mut out = Vec::with_capacity(toc_end + data_region.len() + trailer.len());
+    out.extend_from_slice(&original[..HEADER_SIZE]);
     out.extend_from_slice(&toc_cipher);
-    out.resize(data_start, 0);
     out.extend_from_slice(&data_region);
     out.extend_from_slice(trailer);
 
