@@ -27,6 +27,12 @@ pub fn codec_name(codec: u8) -> &'static str {
         CODEC_STORED => "stored",
         CODEC_ZLIB => "zlib",
         CODEC_BC1 => "bcpack-bc1",
+        // Named but not yet decodable; see BCPack codec IDs.
+        0x0C => "bcpack-bc3",
+        0x10 => "bcpack-bc4",
+        0x14 => "bcpack-bc5",
+        0x18 => "bcpack-bc6h",
+        0x1C => "bcpack-bc7",
         _ => "?",
     }
 }

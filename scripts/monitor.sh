@@ -92,10 +92,44 @@ for i in json.load(sys.stdin):
   echo "$issues_now" > "$issues_file"
 done
 
+# === Our GitHub notifications + replies to our threads ===
+# Uses the nineforge0 token file if present.
+TOKEN_FILE="/Users/alexanderortiz/.t3/userdata/secrets/files/6048ce23b2ce05357ae640c803d5aeab"
+if [[ -f "$TOKEN_FILE" ]]; then
+  GH_TOKEN=$(cat "$TOKEN_FILE")
+  notifs=$(curl -s -H "Authorization: token $GH_TOKEN" "https://api.github.com/notifications?per_page=30" 2>/dev/null || echo "[]")
+  count=$(echo "$notifs" | python3 -c "import json,sys; d=json.load(sys.stdin); print(len(d) if isinstance(d,list) else 0)" 2>/dev/null || echo 0)
+  if [[ "$count" -gt 0 ]]; then
+    echo "=== GITHUB NOTIFICATIONS ($count unread) ===" >> "$REPORT_FILE"
+    echo "$notifs" | python3 -c "
+import json,sys
+for n in json.load(sys.stdin):
+    print(f\"  [{n['reason']}] {n['repository']['full_name']}: {n['subject']['title']}\")
+" >> "$REPORT_FILE" 2>/dev/null || true
+    echo "" >> "$REPORT_FILE"
+    hot_count=$((hot_count + 1))
+  fi
+
+  # Track replies on threads we contributed to
+  for pr in "zeozeozeo/rpf9/2" "Ahmet-Dedeler/awesome-gta6-reverse-engineering/17" "omonkeyz/xbox-emulator/142" "Marvisak/VIctory/614" "ivall/xcl/878" "Ahmet-Dedeler/bcpack-rs/4"; do
+    repo="${pr%/*}"; num="${pr##*/}"
+    pr_file="${STATE_DIR}/thread_${repo//\//_}_${num}.count"
+    cur=$(curl -s -H "Authorization: token $GH_TOKEN" "https://api.github.com/repos/$repo/issues/$num/comments?per_page=100" 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print(len(d) if isinstance(d,list) else 0)" 2>/dev/null || echo 0)
+    if [[ -f "$pr_file" ]]; then
+      old=$(cat "$pr_file")
+      if [[ "$cur" -gt "$old" ]]; then
+        echo "[$repo#$num] $((cur-old)) new comment(s) on a thread we contributed to" >> "$REPORT_FILE"
+        hot_count=$((hot_count + 1))
+      fi
+    fi
+    echo "$cur" > "$pr_file"
+  done
+fi
+
 # === Summary line ===
 total=$((merged_count + hot_count))
 if [[ $total -gt 0 ]]; then
-  echo "=== FORGE9: $merged_count repos with new merges, $hot_count with hot issues ==="
+  echo "=== FORGE9: $merged_count repos with new merges, $hot_count hot items ==="
   cat "$REPORT_FILE"
   exit 0
 else

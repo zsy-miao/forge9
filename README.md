@@ -13,7 +13,7 @@ RPF9 is a container format used by a well-known retail game engine. This tool ha
 - **Tree / search** nested RPF9 archives by magic, extension, size or content
 - **Replace / repack** entries in place or at any size, re-encrypting the TOC
 - **Decode payloads**: AWC audio streams, SGD5 shader databases, Bink 2 video headers, PSIN game data, paged resources
-- **Textures**: list RDS5 (`.ttpf`) stores and decode BCPack BC1 textures to DDS or PNG
+- **Textures**: list RDS5 (`.ttpf`) stores and decode BCPack BC1 to DDS or PNG (fitted endpoint tables; output is approximate, see [bcpack-rs#4](https://github.com/Ahmet-Dedeler/bcpack-rs/issues/4))
 - **Mod packs**: a TOML manifest of entry replacements, verified and applied in one command
 - **Hexdump** individual entries for analysis
 - **JSON output** for integration with other tools
@@ -127,7 +127,7 @@ given (uncompressed); readers detect zlib per entry, so plain payloads read back
 | Pipeline cache | `PS 00 09` | `pipelines` | Header, graphics/compute PSO records, shader slots, metadata and code ranges |
 | Bink 2 video | `KB2?` | `bink` | Header: size, frames, dimensions, frame rate |
 | Paged resource | `0DRP` | `resource` | Kind detection, virtual/physical pointer resolution |
-| RDS5 texture store | `RDS5` | `texture` | Chunk table, ETPF index; BCPack BC1 decode to DDS/PNG (mip 0) |
+| RDS5 texture store | `RDS5` | `texture` | Chunk table, ETPF index; BCPack BC1 decode to DDS/PNG (mip 0, fitted tables — endpoints approximate) |
 | XML, DDS, PNG, GFX, RBF | various | `list` | Detected only |
 
 ## Architecture
