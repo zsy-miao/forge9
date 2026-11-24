@@ -14,6 +14,7 @@ RPF9 is a container format used by a well-known retail game engine. This tool ha
 - **Replace / repack** entries in place or at any size, re-encrypting the TOC
 - **Decode payloads**: AWC audio streams, SGD5 shader databases, Bink 2 video headers, PSIN game data, paged resources
 - **Textures**: list RDS5 (`.ttpf`) stores and decode BCPack BC1 to DDS or PNG (fitted endpoint tables; output is approximate, see [bcpack-rs#4](https://github.com/Ahmet-Dedeler/bcpack-rs/issues/4)), and BCPack BC3/BC5/BC7 to DDS (DX10) or PNG, including array slices (bcpack-rs `bc5-bc7` branch; checked against the stored mip pyramid on all 129 BC3/BC5/BC7 chunks we have)
+- **Models**: export a drawable's LOD geometry (positions, indices, UVs when present) to glTF 2.0 (`.glb`, or `.gltf` + `.bin`) or OBJ. Checked only on a synthetic drawable so far: no local archive holds a drawable yet
 - **Mod packs**: a TOML manifest of entry replacements, verified and applied in one command
 - **Hexdump** individual entries for analysis
 - **JSON output** for integration with other tools
@@ -94,6 +95,11 @@ forge9 bink archive.rpf 3
 forge9 psin script.rpf 0 --structs
 forge9 resource archive.rpf 7
 
+# Drawable (model) geometry: LOD 0 by default; unhandled vertex formats are skipped and named
+forge9 model props.rpf 12 -o prop.glb          # binary glTF
+forge9 model props.rpf 12 -o prop.gltf         # glTF JSON + prop.bin
+forge9 model props.rpf 12 --obj prop.obj --lod 1
+
 # Texture stores (.ttpf files sit next to the archives, not inside them)
 forge9 texture store.ttpf                       # list: size, format, mips, tile mode, hash
 forge9 texture store.ttpf --extract 12 -o a.dds # BC1/BC3/BC5/BC7 mip 0 as DDS
@@ -149,6 +155,7 @@ given (uncompressed); readers detect zlib per entry, so plain payloads read back
 | Pipeline cache | `PS 00 09` | `pipelines` | Header, graphics/compute PSO records, shader slots, metadata and code ranges |
 | Bink 2 video | `KB2?` | `bink` | Header: size, frames, dimensions, frame rate |
 | Paged resource | `0DRP` | `resource` | Kind detection, virtual/physical pointer resolution |
+| Drawable (model) | (paged, no magic) | `model` | Standalone drawables: LOD groups → models → geometries; positions in formats 66 (quantized) and 99 (float3), float2/snorm16 UVs, clustered meshlet indices; to glTF/OBJ. Normals, skinning, materials, dictionaries and fragments not yet decoded. Checked only on a synthetic drawable |
 | RDS5 texture store | `RDS5` | `texture` | Chunk table, ETPF index; mip 0 to DDS/PNG: BCPack BC1 (fitted tables — endpoints approximate), BCPack BC3/BC5/BC7 and plain BC3/BC5/BC7 (tile modes 0-3) |
 | XML, DDS, PNG, GFX, RBF | various | `list` | Detected only |
 
@@ -174,6 +181,7 @@ src/
     rdna2.rs        RDNA2 (GFX10.3) instruction-length decoder and classifier
     ps09.rs         PS09 driver pipeline cache
     bink.rs         Bink 2 video headers
+    drawable.rs     drawable geometry, glTF/OBJ writers
     resource.rs     0DRP paged resources
     texture.rs      RDS5 texture stores (via bcpack-rs)
   modding/          mod packs
@@ -213,7 +221,7 @@ cargo build --release
 - [x] BCPack BC1 texture decoding
 - [x] BCPack BC3/BC5/BC7 texture decoding (mip 0, array slices)
 - [ ] Full mip chains and cube maps (tile modes 9/10)
-- [ ] Model export (glTF) from paged resources
+- [x] Model export (glTF/OBJ) from standalone drawables (needs checking on real models)
 - [ ] Pipeline cache (PS09) parsing
 - [ ] Streaming world analysis tools
 

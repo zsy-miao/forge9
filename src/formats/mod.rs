@@ -3,6 +3,7 @@
 pub mod awc;
 pub mod bcpack_analyze;
 pub mod bink;
+pub mod drawable;
 pub mod fssm;
 pub mod ps09;
 pub mod rdna2;

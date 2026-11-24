@@ -175,6 +175,21 @@ enum Command {
         /// Entry index; `5/3` descends into nested RPF9s
         index: String,
     },
+    /// Export a drawable entry's LOD geometry as glTF (.glb, or .gltf + .bin) or OBJ
+    Model {
+        archive: PathBuf,
+        /// Entry index; `5/3` descends into nested RPF9s
+        index: String,
+        /// glTF output: binary unless the name ends in .gltf (default: model.glb)
+        #[arg(short, long, conflicts_with = "obj")]
+        output: Option<PathBuf>,
+        /// Write Wavefront OBJ here instead
+        #[arg(long)]
+        obj: Option<PathBuf>,
+        /// LOD to export, 0 = highest detail
+        #[arg(long, default_value_t = 0)]
+        lod: usize,
+    },
     /// List textures in an RDS5 (.ttpf) store, or export one BC1/BC3/BC5/BC7 texture's mip 0
     Texture {
         store: PathBuf,
@@ -295,6 +310,7 @@ fn main() -> Result<()> {
         }
         Command::Bink { archive, index } => cmd_bink(&load_entry(&archive, &crypto, &index)?),
         Command::Resource { archive, index } => cmd_resource(&load_entry(&archive, &crypto, &index)?),
+        Command::Model { archive, index, output, obj, lod } => cmd_model(&load_entry_blocks(&archive, &crypto, &index)?, output, obj, lod),
         Command::Mod(ModCommand::Apply { manifest, output, archive }) => {
             let m = modding::manifest::Manifest::load(&manifest)?;
             modding::apply::apply(&m, archive.as_deref(), &crypto, &output)
@@ -509,14 +525,20 @@ fn search(raw: &[u8], label: &str, crypto: &rpf9::crypto::CryptoContext, f: &Sea
 
 /// Reads an entry by `index`, where `a/b/c` descends through nested RPF9s.
 fn load_entry(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, index: &str) -> Result<Vec<u8>> {
-    let mut bytes = std::fs::read(path)?;
+    Ok(load_entry_blocks(path, crypto, index)?.concat())
+}
+
+/// Like `load_entry`, keeping the final entry's inflated zlib blocks apart.
+fn load_entry_blocks(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, index: &str) -> Result<Vec<Vec<u8>>> {
+    let mut blocks = vec![std::fs::read(path)?];
     for part in index.split(['/', '#']).filter(|p| !p.is_empty()) {
         let i: usize = part.parse().with_context(|| format!("bad entry index {part:?}"))?;
+        let bytes = if blocks.len() == 1 { blocks.pop().unwrap() } else { blocks.concat() };
         let archive = rpf9::reader::Archive::open(&bytes, crypto)?;
         let entry = archive.entries().get(i).ok_or_else(|| anyhow::anyhow!("entry index {i} out of range"))?;
-        bytes = archive.read_entry(entry)?;
+        blocks = archive.read_entry_blocks(entry)?;
     }
-    Ok(bytes)
+    Ok(blocks)
 }
 
 fn cmd_awc(bytes: &[u8]) -> Result<()> {
@@ -658,6 +680,33 @@ fn cmd_resource(bytes: &[u8]) -> Result<()> {
     let version = r.version.map_or(String::new(), |v| format!(" version {v:#x}"));
     println!("{:?} resource, {} bytes, magic {magic}{version}", r.kind, bytes.len());
     println!("  pointer-like words: {} virtual, {} physical", r.virtual_ptrs, r.physical_ptrs);
+    Ok(())
+}
+
+fn cmd_model(blocks: &[Vec<u8>], output: Option<PathBuf>, obj: Option<PathBuf>, lod: usize) -> Result<()> {
+    use formats::drawable;
+    let d = drawable::parse_blocks(blocks, lod)?;
+    for s in &d.skipped { eprintln!("  skipped {s}"); }
+    let out = match obj {
+        Some(path) => { std::fs::write(&path, drawable::to_obj(&d))?; path }
+        None => {
+            let path = output.unwrap_or_else(|| PathBuf::from("model.glb"));
+            if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("gltf")) {
+                let bin = path.with_extension("bin");
+                let (json, data) = drawable::to_gltf(&d, Some(&bin.file_name().unwrap().to_string_lossy()));
+                std::fs::write(&path, json)?;
+                std::fs::write(&bin, data)?;
+            } else {
+                std::fs::write(&path, drawable::to_glb(&d))?;
+            }
+            path
+        }
+    };
+    let verts: usize = d.meshes.iter().map(|m| m.positions.len()).sum();
+    let tris: usize = d.meshes.iter().map(|m| m.indices.len() / 3).sum();
+    let uv = d.meshes.iter().filter(|m| m.uvs.is_some()).count();
+    println!("{} LOD{}: {} meshes ({uv} with UVs), {verts} vertices, {tris} triangles, {} skipped → {}",
+        d.name, d.lod, d.meshes.len(), d.skipped.len(), out.display());
     Ok(())
 }
 

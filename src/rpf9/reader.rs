@@ -80,6 +80,12 @@ impl<'a> Archive<'a> {
     }
 
     pub fn read_entry(&self, entry: &Entry) -> Result<Vec<u8>> {
+        Ok(self.read_entry_blocks(entry)?.concat())
+    }
+
+    /// Entry content as its separately inflated zlib blocks (one block if stored raw).
+    /// Paged resources keep their system and graphics segments on block boundaries.
+    pub fn read_entry_blocks(&self, entry: &Entry) -> Result<Vec<Vec<u8>>> {
         let start = entry.offset as usize;
         let end = start + entry.size as usize;
         if end > self.data.len() {
@@ -89,12 +95,12 @@ impl<'a> Archive<'a> {
         if entry.is_zlib(self.data) {
             inflate_zlib_chain(raw)
         } else {
-            Ok(raw.to_vec())
+            Ok(vec![raw.to_vec()])
         }
     }
 }
 
-fn inflate_zlib_chain(data: &[u8]) -> Result<Vec<u8>> {
+fn inflate_zlib_chain(data: &[u8]) -> Result<Vec<Vec<u8>>> {
     use std::io::Read;
     let mut out = Vec::new();
     let mut pos = 0;
@@ -106,7 +112,7 @@ fn inflate_zlib_chain(data: &[u8]) -> Result<Vec<u8>> {
         let mut chunk = Vec::new();
         decoder.read_to_end(&mut chunk)?;
         let consumed = decoder.total_in() as usize;
-        out.extend_from_slice(&chunk);
+        out.push(chunk);
         pos += consumed;
         let align = (16 - (pos % 16)) % 16;
         pos += align;
