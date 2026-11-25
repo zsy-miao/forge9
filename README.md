@@ -1,10 +1,13 @@
-# forge9
+# ![forge9](assets/forge9-banner.png)
 
-General-purpose toolkit for RPF9 archives. Read, decrypt, inspect, extract and analyze.
+Forge9 is a Rust CLI and library for RPF9 archives and graphics diagnostics.
 
-RPF9 is a container format used by a well-known retail game engine. This tool handles decryption, TOC parsing, entry listing, content extraction, and format detection: a foundation for research, interoperability work and asset tooling.
+- **Verify archive changes.** Inspect and extract entries, apply hash-guarded patches, and compare the inflated content after repacking. Offsets may change. [Repack validation](docs/repack_validation.md)
+- **Investigate a bad frame.** Match runtime shader IDs to the native program and check captured positions against reference geometry. Report frame timing from Windows or macOS. [Shader and frame diagnostics](docs/shader_compile_cost.md#match-a-runtime-report-to-a-shader) · [Geometry checks](docs/geometry_check.md)
+- **Preview exported assets.** Orbit a GLB model, inspect its meshes and materials, and open an exported texture in the browser. [Local asset viewer](viewer/README.md)
+- **Estimate texture payload budgets.** Compare the declared mip chain with the largest one, two, or three levels omitted. [Texture budget](docs/texture_budget.md)
 
-**Format reference:** [docs/rpf9_format.md](docs/rpf9_format.md), the RPF9 container spec (header, encryption, TOC columns, record layouts, names, compression), with what is known and what is still unknown.
+[Try it without an archive or keys](#try-it-without-an-archive-or-keys) · [RPF9 format reference](docs/rpf9_format.md) · [Contributing](CONTRIBUTING.md)
 
 ## Scope and provenance
 
@@ -44,13 +47,36 @@ reproduce, distribute or enable access to any protected work.
 
 ## Install
 
-Prebuilt binaries for Windows (x86_64), Linux (x86_64) and macOS (arm64, x86_64) are on the [Releases page](https://github.com/nineforge0/forge9/releases): download `forge9-<target>` (`.exe` on Windows) and put it on your `PATH`.
+Check the [Releases page](https://github.com/nineforge0/forge9/releases) for prebuilt binaries. Download the asset for your platform and put it on your `PATH`.
 
 Or build from source with a stable Rust toolchain:
 
 ```bash
 cargo install --git https://github.com/nineforge0/forge9
 ```
+
+### Try it without an archive or keys
+
+Open a terminal in an empty directory. This example uses two small XML files you create:
+
+```bash
+forge9 hash demo_marker
+printf '%s\n' '<settings><speed value="1"/></settings>' > original.xml
+printf '%s\n' '<settings><speed value="2"/></settings>' > edited.xml
+forge9 mod make --path 0 original.xml edited.xml
+```
+
+The last command prints a TOML patch with the original file's SHA-256 and the XML edit.
+For a graphics diagnostic you can reproduce with synthetic buffers, see the
+[geometry smoke test](docs/geometry_check.md#synthetic-smoke-test).
+
+From a source checkout, try the frame report with three synthetic intervals:
+
+```bash
+printf 'frame_ms\n16\n30\n50\n' | python3 scripts/frame_times.py -
+```
+
+The report shows a median frame interval of 30 ms and a p95 of 50 ms.
 
 ## Usage
 
@@ -111,6 +137,7 @@ forge9 shaders shaders.rpf 0 --summary     # counts per stage and tag
 forge9 fssm shaders.rpf 0 --roots
 forge9 fssm shaders.rpf 2 --shader 2       # full layout + used resources of one record
 forge9 fssm shaders.rpf 0                  # programs per stage
+forge9 fssm shaders.rpf 0 --json           # record and program IDs for matching runtime reports
 
 # RDNA2 machine code of each FSSM program: instruction families and
 # wave64-sensitive ops (DPP, permlane, readlane, 64-bit EXEC/VCC masks, ...)
@@ -154,6 +181,7 @@ forge9 check-positions dump/g0.json capture.bin --layout clip --stride 16
 
 # Texture stores (.ttpf files sit next to the archives, not inside them)
 forge9 texture store.ttpf                       # list: size, format, mips, tile mode, hash
+forge9 texture store.ttpf --budget              # nominal payload bytes for mip drops 0 through 3
 forge9 texture store.ttpf --extract 12 -o a.dds # BC1/BC3/BC4/BC5/BC7 mip 0 as DDS
 forge9 texture store.ttpf --decode 12 -o a.png  # mip 0 as PNG (BC5 as red/green)
 forge9 texture store.ttpf --decode 300 --slice 5 # one slice of an array texture
@@ -175,9 +203,14 @@ forge9 --dict names.txt psin script.rpf 1 --structs
 # the TOC's u32 name hash column, a column beside the records rather than a record field; some
 # archives have no such column, or one shorter than their records.
 forge9 --dict names.txt catalog common.rpf script.rpf
-forge9 --dict names.txt catalog common.rpf --write-dict names.txt  # accumulate confirmed candidates into a sorted, deduped dict
+forge9 catalog common.rpf --write-dict recovered.txt                  # create a sorted dictionary of unique JOAAT matches
+forge9 --dict recovered.txt catalog script.rpf --write-dict recovered.txt  # reuse and add names
 forge9 catalog common.rpf --json             # array of {id, archive, path, hash, kind, stored, inflated, status, name, evidence, candidates}
 ```
+
+Use a regular file for `--write-dict`. If a process is killed during an update, it may
+leave a `.forge9-tmp` file alongside the dictionary. Remove that staging file after
+checking that the original writer is no longer running.
 
 ### Mod packs
 
@@ -306,7 +339,7 @@ cargo build --release
 - [x] BCPack BC3/BC5/BC7 texture decoding (mip 0, array slices)
 - [ ] Full mip chains and cube maps (tile modes 9/10)
 - [x] Model export (glTF/OBJ) from standalone drawables and drawable dictionaries (checked on a real dictionary)
-- [ ] Pipeline cache (PS09) parsing
+- [x] Pipeline cache (PS09) parsing and graphics/compute shader slot inspection
 - [ ] Streaming world analysis tools
 
 ## Contributing

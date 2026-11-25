@@ -80,3 +80,9 @@ src/
 
 Not ready to write code? Open an issue with the layout you've worked out: offsets, types, sample values and how
 many files you checked it against. That is often the hardest part of a decoder.
+
+For a graphics regression, report one reproducible draw or a short scene. Include
+the runtime commit, adapter and driver, cache state, expected image, and first
+observed failure. A small synthetic fixture, timing summary, or a description of
+the failed binding gives others a way to reproduce it. Keep original archives,
+shader binaries, captured buffers, and logs with private paths local.

@@ -2,6 +2,8 @@
 
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, HashMap};
+use std::fs::{self, File};
+use std::io::{ErrorKind, Write};
 use std::path::Path;
 
 const KNOWN: &[(u32, &str)] = &[
@@ -102,14 +104,36 @@ pub fn merge_dict(existing: &str, entries: impl IntoIterator<Item = (u32, String
 /// Merges `entries` into `path` (creating it if absent) as sorted, deduplicated `hexhash name`
 /// lines. Returns `(added, total)`.
 pub fn write_dict(path: &Path, entries: impl IntoIterator<Item = (u32, String)>) -> Result<(usize, usize)> {
-    let existing = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e).with_context(|| format!("reading dict {}", path.display())),
-    };
-    let (formatted, added, total) = merge_dict(&existing, entries);
-    std::fs::write(path, formatted).with_context(|| format!("writing dict {}", path.display()))?;
-    Ok((added, total))
+    let name = path.file_name().context("dictionary path needs a filename")?;
+    let mut temp_name = name.to_os_string();
+    temp_name.push(".forge9-tmp");
+    let temp_path = path.with_file_name(temp_name);
+    // Claim the staging file before reading so concurrent writers cannot lose entries.
+    let mut temp = File::options().write(true).create_new(true).open(&temp_path).with_context(|| {
+        format!("creating {} (if it exists after an interrupted write, remove it once the other writer has stopped)", temp_path.display())
+    })?;
+    let result: Result<_> = (|| {
+        let existing = match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                anyhow::ensure!(metadata.is_file(), "{} is not a regular file", path.display());
+                anyhow::ensure!(!metadata.permissions().readonly(), "{} is read-only", path.display());
+                temp.set_permissions(metadata.permissions())?;
+                fs::read_to_string(path)?
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e.into()),
+        };
+        let (formatted, added, total) = merge_dict(&existing, entries);
+        temp.write_all(formatted.as_bytes())?;
+        temp.sync_all()?;
+        drop(temp);
+        fs::rename(&temp_path, path)?;
+        Ok((added, total))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result.with_context(|| format!("updating dict {}", path.display()))
 }
 
 #[cfg(test)]
@@ -140,5 +164,20 @@ mod tests {
         ]);
         assert_eq!((added, total), (2, 3));
         assert_eq!(text, "0x00000010 earlier\n0x00000020 kept_name\n0x00000030 later\n");
+    }
+
+    #[test]
+    fn write_dict_keeps_existing_contents_if_output_is_busy() {
+        let path = std::env::temp_dir().join(format!("forge9-busy-dict-{}.txt", std::process::id()));
+        let staged = path.with_extension("txt.forge9-tmp");
+        let original = "0x00000020 saved_name\n";
+        fs::write(&path, original).unwrap();
+        fs::write(&staged, "pending data").unwrap();
+
+        assert!(write_dict(&path, [(0x30, "another_name".into())]).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert_eq!(fs::read_to_string(&staged).unwrap(), "pending data");
+        fs::remove_file(staged).unwrap();
+        fs::remove_file(path).unwrap();
     }
 }

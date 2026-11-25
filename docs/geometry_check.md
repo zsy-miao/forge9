@@ -104,6 +104,22 @@ What the results point to:
 - `clip` fit uses under half the elements: the elements are not this
   geometry (wrong buffer, stale data, another order), or the mesh is skinned.
 
+## Synthetic smoke test
+
+From a source checkout, run the position checks on original, in-memory meshes:
+
+```bash
+cargo test --release --locked formats::geometry_check::tests
+```
+
+The tests cover model-space and clip-space captures, meshlet order, and
+corrupted positions. For a runtime comparison, start with one rigid draw and
+record the build SHA, GPU and driver, geometry and LOD, capture layout,
+stride, offset, ordering, and the tool's summary. Keep the captured buffers
+local. If the stored bytes match but the clip-space check fails, compare
+the draw's resource bindings and transforms before changing the position
+decoder.
+
 ## Worked example
 
 `cvar_am_python_head_01a` (entry `1/28` of `core_restofworld.rpf`):

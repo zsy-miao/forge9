@@ -81,6 +81,41 @@ pub fn dxgi_name(dxgi: u32) -> &'static str {
     }
 }
 
+/// Tightly packed payload bytes after dropping 0, 1, 2 or 3 of the largest mips.
+/// The smallest declared mip is always retained. Includes array slices for
+/// tile modes 0–3, and excludes padding or extra copies made by a driver.
+pub fn mip_payload_budget(tex: &Texture) -> Option<[u64; 4]> {
+    let (block_width, bytes_per_block) = match tex.dxgi {
+        28 | 29 | 87 | 91 => (1, 4),
+        70..=72 | 79..=81 => (4, 8),
+        73..=78 | 82..=84 | 94..=99 => (4, 16),
+        _ => return None,
+    };
+    if tex.width == 0 || tex.height == 0 || tex.array_size == 0 || tex.tile_mode > 3
+        || tex.mips == 0 || tex.mips > tex.width.max(tex.height).ilog2() + 1
+    {
+        return None;
+    }
+
+    let mut removable = [0; 3];
+    let mut full: u64 = 0;
+    for level in 0..tex.mips {
+        let wide = (tex.width >> level).max(1).div_ceil(block_width);
+        let high = (tex.height >> level).max(1).div_ceil(block_width);
+        let bytes = (u64::from(wide) * u64::from(high))
+            .checked_mul(bytes_per_block)?
+            .checked_mul(tex.array_size.into())?;
+        full = full.checked_add(bytes)?;
+        if level + 1 < tex.mips {
+            if let Some(slot) = removable.get_mut(level as usize) {
+                *slot = bytes;
+            }
+        }
+    }
+    let [first, second, third] = removable;
+    Some([full, full - first, full - first - second, full - first - second - third])
+}
+
 pub fn codec_name(codec: u8) -> &'static str {
     match codec {
         CODEC_STORED => "stored",
@@ -325,6 +360,28 @@ mod tests {
         let px = bcpack::ttpf::bc1_to_rgba(&block, 1, 1, 3, 1);
         assert_eq!(px, [0, 0, 0, 255, 255, 255, 255, 255, 127, 127, 127, 255]);
         assert_eq!(&bcpack::ttpf::bc1_to_rgba(&block, 1, 1, 4, 1)[12..], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn estimates_payload_after_largest_mip_drops() {
+        let tex = Texture {
+            index: 0,
+            hash: 0,
+            width: 9,
+            height: 5,
+            mips: 3,
+            dxgi: 71,
+            array_size: 3,
+            tile_mode: 3,
+            vstart: 0,
+        };
+        assert_eq!(mip_payload_budget(&tex), Some([192, 48, 24, 24]));
+        assert_eq!(mip_payload_budget(&Texture { dxgi: 98, ..tex }), Some([384, 96, 48, 48]));
+        assert_eq!(mip_payload_budget(&Texture { dxgi: 87, ..tex }), Some([660, 120, 24, 24]));
+        assert_eq!(mip_payload_budget(&Texture { mips: 1, ..tex }), Some([144; 4]));
+        assert_eq!(mip_payload_budget(&Texture { mips: 8, ..tex }), None);
+        assert_eq!(mip_payload_budget(&Texture { tile_mode: 9, ..tex }), None);
+        assert_eq!(mip_payload_budget(&Texture { dxgi: 0, ..tex }), None);
     }
 
     #[test]

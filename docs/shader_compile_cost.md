@@ -66,3 +66,58 @@ project:
 3. **Budget memory** for the known-large builds instead of OOMing on discovery.
 
 Reproduce the full ranking with `forge9 isa shaders.rpf 0 --heavy <N>`.
+
+## Match a runtime report to a shader
+
+```bash
+forge9 fssm shaders.rpf 0 --json > shaders.json
+forge9 fssm shaders.rpf 0 --shader 594 --json
+```
+
+The `forge9-fssm-v1` JSON lists every SGD5 record and its native programs
+in XDAT order. Each readable FSSM program includes its stages, wave sizes,
+and declared machine-code byte counts. A failed record or section includes
+an `error` field while the remaining entries stay in the inventory.
+
+| Field | Match against |
+| --- | --- |
+| `dxbc_fnv1a64` | XCL's `--record-hash` and `--measure-pso` IDs for an inflated DXBC record. |
+| `programs[].fssm_sha256` | The SHA-256 of the complete inflated FSSM sidecar in a Leonida shader index. |
+| `sgd5_marker_offset` and `name` | VIctory's `translate --list` entries, within the same SGD5 payload. The offset is a byte count from the entry's start. |
+
+A record can contain several native programs. Keep the container ID and
+FSSM IDs separate when comparing reports. Compare the source entry,
+backend, GPU, driver, scene, and cache state before interpreting timings.
+The inventory contains metadata. Keep source archives and captured buffers
+local.
+
+To summarize the presentation cadence of an individual run, pass a
+[PresentMon CSV](https://github.com/GameTechDev/PresentMon/blob/main/README-CaptureApplication.md)
+or a CSV with a `frame_ms` column to the standard-library script:
+
+```bash
+python3 scripts/frame_times.py capture.csv
+```
+
+Filter captures with multiple streams using `--process-id` and
+`--swap-chain`. The report gives p50, p95 and p99 and summarizes available
+CPU, GPU and display timing columns separately. Compare like-for-like runs
+and verify that the expected content renders. Presentation frequency alone
+can include repeated or incomplete frames.
+
+On macOS, launch the renderer with `MTL_HUD_ENABLED=1` and
+`MTL_HUD_LOG_ENABLED=1`. Export the
+[Metal HUD log](https://developer.apple.com/documentation/xcode/monitoring-your-metal-apps-graphics-performance)
+for only the rendering process and the interval you want to compare:
+
+```bash
+log show --last 10m --style compact --process "$renderer_pid" --info \
+    --predicate 'eventMessage CONTAINS "metal-HUD:"' > metal-hud.log
+python3 scripts/frame_times.py --metal-hud metal-hud.log
+```
+
+The same percentile summary applies to presentation intervals. Metal HUD
+time covers whole command buffers by default and can include gaps between
+encoders. The report labels it `metal_gpu_time_ms` to distinguish it from
+PresentMon's GPU-busy time. Use a live Metal System Trace to separate copy
+encoders, GPU execution and idle periods.

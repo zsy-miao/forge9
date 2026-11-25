@@ -1,5 +1,7 @@
 # Build artifacts
 /target/
+/viewer/node_modules/
+/viewer/dist/
 **/*.exe
 **/*.pdb
 
@@ -29,3 +31,9 @@ Thumbs.db
 # Added by cargo
 
 /target
+
+.codegraph/
+reports/
+examples/probe.rs
+viewer/node_modules/
+viewer/dist/

@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Forge9 Asset Viewer</title>
+    <meta name="description" content="Inspect local GLB models and textures with Forge9.">
+  </head>
+  <body>
+    <header class="masthead">
+      <h1 class="identity">
+        <span class="wordmark">forge<span>9</span></span>
+        <span class="app-name">Asset viewer</span>
+      </h1>
+      <div class="file-actions">
+        <button type="button" class="button button-quiet" id="demo">Load sample</button>
+        <label class="button button-primary">
+          <input
+            type="file"
+            class="visually-hidden"
+            id="file-input"
+            accept=".glb,.png,.jpg,.jpeg,.webp"
+            aria-describedby="input-formats"
+          >
+          <span class="open-icon" aria-hidden="true">↗</span>
+          Open asset
+        </label>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section class="stage" aria-label="Asset preview">
+        <div class="stage-header">
+          <div class="asset-heading">
+            <span class="asset-kind" id="asset-kind">Model</span>
+            <h2 id="object-name">Sample model</h2>
+          </div>
+          <div class="stage-actions" aria-label="View controls">
+            <label class="view-toggle"><input type="checkbox" id="grid" checked> Grid</label>
+            <label class="view-toggle"><input type="checkbox" id="wireframe"> Wireframe</label>
+            <button type="button" class="button button-frame" id="reset-view">Reset view</button>
+          </div>
+        </div>
+
+        <div class="drop-zone" id="drop-zone">
+          <div id="viewport"></div>
+          <img id="preview-image" alt="Selected texture" hidden>
+          <div class="drop-prompt" aria-hidden="true">Drop to open asset</div>
+        </div>
+
+        <footer class="stage-footer">
+          <span id="status" role="status" aria-live="polite">Opening sample model…</span>
+          <span class="orbit-hint">Drag to orbit · Scroll to zoom</span>
+        </footer>
+      </section>
+
+      <aside class="inspector" aria-labelledby="inspector-title">
+        <div class="inspector-header">
+          <h2 id="inspector-title">Inspector</h2>
+        </div>
+        <section class="inspector-section" aria-labelledby="geometry-title">
+          <h3 id="geometry-title">Asset details</h3>
+          <dl class="metrics">
+            <div><dt>Dimensions</dt><dd id="dimensions">-</dd></div>
+            <div><dt>Vertices</dt><dd id="vertex-count">-</dd></div>
+            <div><dt>Triangles</dt><dd id="triangle-count">-</dd></div>
+            <div><dt>Meshes</dt><dd id="mesh-count">-</dd></div>
+            <div><dt>Materials</dt><dd id="material-count">-</dd></div>
+            <div><dt>Textures</dt><dd id="texture-count">-</dd></div>
+          </dl>
+        </section>
+        <section class="inspector-section mesh-section" aria-labelledby="meshes-title">
+          <h3 id="meshes-title">Mesh visibility</h3>
+          <div id="mesh-list"></div>
+        </section>
+        <p id="input-formats" class="formats">Drop a GLB, PNG, JPEG, or WebP. Files stay in this browser.</p>
+      </aside>
+    </main>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
