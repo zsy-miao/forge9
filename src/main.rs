@@ -773,15 +773,35 @@ fn harvest(archives: &[rpf9::reader::Archive], crypto: &rpf9::crypto::CryptoCont
     Ok((targets.len(), found))
 }
 
-/// Calls `f(path, word, joaat)` for every identifier-like string (`[A-Za-z0-9_]{3,64}`, as found
-/// and lowercased) in the entries that are not nested archives.
+/// Calls `f(path, word, joaat)` for every identifier-like string (`[A-Za-z0-9_]{3,64}`) and dotted
+/// identifier run (`[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)+`, 3–64 bytes), as found and lowercased, in the
+/// entries that are not nested archives.
 fn scan_words(archive: &rpf9::reader::Archive, crypto: &rpf9::crypto::CryptoContext, f: &mut dyn FnMut(&str, &str, u32)) -> Result<()> {
+    let mut emit = |path: &str, bytes: &[u8]| {
+        if !(3..=64).contains(&bytes.len()) { return; }
+        let word = std::str::from_utf8(bytes).unwrap();
+        f(path, word, rpf9::hashes::joaat(word));
+        let lower = word.to_ascii_lowercase();
+        if lower != word { f(path, &lower, rpf9::hashes::joaat(&lower)); }
+    };
     walk(archive, "", crypto, &mut |path, a, e, nested| {
         if nested { return; }
         let bytes = content(a, e);
-        for word in bytes.split(|b| !(b.is_ascii_alphanumeric() || *b == b'_')).filter(|w| (3..=64).contains(&w.len())) {
-            let word = std::str::from_utf8(word).unwrap();
-            for w in [word.to_string(), word.to_ascii_lowercase()] { f(path, &w, rpf9::hashes::joaat(&w)); }
+        for run in bytes.split(|b| !(b.is_ascii_alphanumeric() || *b == b'_' || *b == b'.')) {
+            let mut i = 0;
+            while i < run.len() {
+                while i < run.len() && run[i] == b'.' { i += 1; }
+                let start = i;
+                while i < run.len() && (run[i] != b'.' || (i + 1 < run.len() && run[i + 1] != b'.')) { i += 1; }
+                let dotted = &run[start..i];
+                if dotted.is_empty() { continue; }
+                if dotted.contains(&b'.') {
+                    emit(path, dotted);
+                    for part in dotted.split(|&b| b == b'.') { emit(path, part); }
+                } else {
+                    emit(path, dotted);
+                }
+            }
         }
     })
 }
@@ -2052,5 +2072,25 @@ mod tests {
             ("resolved", Some("prop_crate_01.#dr"), label), ("unresolved", None, label)]);
         assert!(rows[..5].iter().all(|r| r.hash.is_none() && r.status() == "unresolved"));
         assert_eq!(rows[6].candidates, [("health_max".to_string(), "string in entry b.rpf:0".to_string())]);
+    }
+
+    #[test]
+    fn catalog_resolves_dotted_candidate_names() {
+        let crypto = crypto();
+        let text = b"<Item>platform:/data/Content.XML</Item> ..setup2.meta.xml. foo..bar".to_vec();
+        let raw = named_archive(
+            &crypto,
+            &[text, b"a".to_vec(), b"b".to_vec(), b"c".to_vec(), b"d".to_vec(), b"e".to_vec()],
+            &[0, joaat("content.xml"), joaat("content"), joaat("setup2.meta.xml"), joaat("foo..bar"), joaat("bar")],
+        );
+        let archives = [("pack.rpf".to_string(), Archive::open(&raw, &crypto).unwrap())];
+        let mut rows = catalog(&archives, &crypto).unwrap();
+        name_rows(&mut rows, &archives, &crypto, &rpf9::hashes::Dict::load(None).unwrap()).unwrap();
+        let ev = "string in entry pack.rpf:0".to_string();
+        assert_eq!(rows[1].candidates, [("content.xml".to_string(), ev.clone())]);
+        assert_eq!(rows[2].candidates, [("content".to_string(), ev.clone())]);
+        assert_eq!(rows[3].candidates, [("setup2.meta.xml".to_string(), ev.clone())]);
+        assert_eq!(rows[4].status(), "unresolved");
+        assert_eq!(rows[5].candidates, [("bar".to_string(), ev)]);
     }
 }
