@@ -175,6 +175,7 @@ forge9 --dict names.txt psin script.rpf 1 --structs
 # the TOC's u32 name hash column, a column beside the records rather than a record field; some
 # archives have no such column, or one shorter than their records.
 forge9 --dict names.txt catalog common.rpf script.rpf
+forge9 --dict names.txt catalog common.rpf --write-dict names.txt  # accumulate confirmed candidates into a sorted, deduped dict
 forge9 catalog common.rpf --json             # array of {id, archive, path, hash, kind, stored, inflated, status, name, evidence, candidates}
 ```
 

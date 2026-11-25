@@ -60,6 +60,9 @@ enum Command {
         archives: Vec<PathBuf>,
         #[arg(long)]
         json: bool,
+        /// Write confirmed candidates as `hexhash name` lines (deduped, sorted), merging into an existing file
+        #[arg(long, value_name = "PATH")]
+        write_dict: Option<PathBuf>,
     },
     /// Extract entries to a directory
     Extract {
@@ -436,7 +439,7 @@ fn main() -> Result<()> {
             Err(e) => { eprintln!("Error: {e:?}"); std::process::exit(2) }
         },
         Command::Harvest { archives } => cmd_harvest(&archives, &crypto, &dict),
-        Command::Catalog { archives, json } => cmd_catalog(&archives, &crypto, &dict, json),
+        Command::Catalog { archives, json, write_dict } => cmd_catalog(&archives, &crypto, &dict, json, write_dict.as_deref()),
         Command::Extract { archive, output, select } => cmd_extract(&archive, &crypto, &output, select),
         Command::Hexdump { archive, index, limit } => cmd_hexdump(&archive, &crypto, index, limit),
         Command::Replace { archive, index, file, output } => cmd_replace(&archive, &crypto, index, &file, &output),
@@ -859,12 +862,49 @@ fn name_rows(rows: &mut [CatalogRow], archives: &[(String, rpf9::reader::Archive
     Ok(())
 }
 
-fn cmd_catalog(paths: &[PathBuf], crypto: &rpf9::crypto::CryptoContext, dict: &rpf9::hashes::Dict, json: bool) -> Result<()> {
+/// Confirmed `(hash, name)` pairs from `catalog` rows: unambiguous single-candidate joaat matches
+/// and embedded resource labels whose name (or stem before `.#`) hashes to the row's hash.
+/// Returns `(entries, skipped_ambiguous)`.
+fn confirmed_catalog_names(rows: &[CatalogRow]) -> (Vec<(u32, String)>, usize) {
+    let mut out = std::collections::BTreeMap::new();
+    let mut ambiguous = std::collections::HashSet::new();
+    for r in rows {
+        let Some(h) = r.hash else { continue };
+        match (&r.name, r.evidence, r.candidates.as_slice()) {
+            (Some(labels), "embedded resource label", _) => {
+                for label in labels.split(", ") {
+                    let stem = label.split_once(".#").map_or(label, |(s, _)| s);
+                    if let Some(m) = [label, stem].into_iter().find(|s| rpf9::hashes::joaat(s) == h) {
+                        out.entry(h).or_insert_with(|| m.to_string());
+                        break;
+                    }
+                }
+            }
+            (None, _, [(name, _)]) if rpf9::hashes::joaat(name) == h => {
+                out.entry(h).or_insert_with(|| name.clone());
+            }
+            (None, _, c) if c.len() > 1 => { ambiguous.insert(h); }
+            _ => {}
+        }
+    }
+    (out.into_iter().collect(), ambiguous.len())
+}
+
+fn cmd_catalog(paths: &[PathBuf], crypto: &rpf9::crypto::CryptoContext, dict: &rpf9::hashes::Dict, json: bool, write_dict: Option<&std::path::Path>) -> Result<()> {
     let raws = paths.iter().map(|p| std::fs::read(p).with_context(|| format!("reading {}", p.display()))).collect::<Result<Vec<_>>>()?;
     let archives = paths.iter().zip(&raws).map(|(p, r)| Ok((p.file_name().unwrap_or_default().to_string_lossy().into_owned(), rpf9::reader::Archive::open(r, crypto)?)))
         .collect::<Result<Vec<_>>>()?;
     let mut rows = catalog(&archives, crypto)?;
     name_rows(&mut rows, &archives, crypto, dict)?;
+    if let Some(out_path) = write_dict {
+        let (entries, skipped) = confirmed_catalog_names(&rows);
+        let (added, total) = rpf9::hashes::write_dict(out_path, entries)?;
+        if skipped > 0 {
+            eprintln!("wrote {total} dict entries ({added} new, {skipped} ambiguous skipped) to {}", out_path.display());
+        } else {
+            eprintln!("wrote {total} dict entries ({added} new) to {}", out_path.display());
+        }
+    }
     if json {
         let records: Vec<_> = rows.iter().map(|r| serde_json::json!({
             "id": r.id(), "archive": r.archive, "path": r.path, "hash": r.hash.map(|h| format!("{h:#010x}")),
@@ -2092,5 +2132,55 @@ mod tests {
         assert_eq!(rows[3].candidates, [("setup2.meta.xml".to_string(), ev.clone())]);
         assert_eq!(rows[4].status(), "unresolved");
         assert_eq!(rows[5].candidates, [("bar".to_string(), ev)]);
+    }
+
+    #[test]
+    fn catalog_write_dict_accumulates_sorted_deduped_entries() {
+        let crypto = crypto();
+        let mut drawable = vec![0u8; 176];
+        for at in [8, 16, 80, 168] { drawable[at..at + 8].copy_from_slice(&(forge9::formats::resource::VIRTUAL_BASE + 176).to_le_bytes()); }
+        drawable.extend(b"prop_crate_01.#dr\0");
+
+        let dict_path = std::env::temp_dir().join(format!("forge9-catalog-dict-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&dict_path);
+
+        // Run 1: archive a.rpf yields a single candidate ("health_max") and an embedded drawable label ("prop_crate_01").
+        let a = named_archive(&crypto, &[b"<x n=\"Health_Max\"/>".to_vec(), b"x".to_vec(), drawable, b"y".to_vec()],
+            &[0xde396fe2, joaat("health_max"), joaat("prop_crate_01"), joaat("no_such_name")]);
+        let archives_a = [("a.rpf".to_string(), Archive::open(&a, &crypto).unwrap())];
+        let mut rows_a = catalog(&archives_a, &crypto).unwrap();
+        name_rows(&mut rows_a, &archives_a, &crypto, &rpf9::hashes::Dict::load(None).unwrap()).unwrap();
+        // Also ensure an ambiguous row with 2 candidates is skipped rather than written.
+        rows_a.push(CatalogRow { archive: "a.rpf".into(), path: "99".into(), hash: Some(0x12345678), ext: "bin", stored: 1, inflated: 1,
+            name: None, evidence: "embedded resource label", candidates: vec![("first".into(), "ev".into()), ("second".into(), "ev".into())] });
+        let (entries_a, skipped) = confirmed_catalog_names(&rows_a);
+        assert_eq!(skipped, 1);
+        assert_eq!(rpf9::hashes::write_dict(&dict_path, entries_a).unwrap(), (2, 2));
+
+        // Run 2: reload the written dict and catalog b.rpf (contains an already-recovered hash + a new candidate).
+        let dict = rpf9::hashes::Dict::load(Some(&dict_path)).unwrap();
+        let b = named_archive(&crypto, &[b"<x n=\"spawn_point\"/>".to_vec(), b"x".to_vec(), b"y".to_vec()],
+            &[0, joaat("health_max"), joaat("spawn_point")]);
+        let archives_b = [("b.rpf".to_string(), Archive::open(&b, &crypto).unwrap())];
+        let mut rows_b = catalog(&archives_b, &crypto).unwrap();
+        name_rows(&mut rows_b, &archives_b, &crypto, &dict).unwrap();
+        assert_eq!((rows_b[1].status(), rows_b[1].name.as_deref(), rows_b[1].evidence), ("resolved", Some("health_max"), "dictionary"));
+        let (entries_b, skipped_b) = confirmed_catalog_names(&rows_b);
+        assert_eq!(skipped_b, 0);
+        assert_eq!(rpf9::hashes::write_dict(&dict_path, entries_b).unwrap(), (1, 3));
+
+        // Verify the accumulated file is deduplicated, sorted by hash, and reloads cleanly.
+        let text = std::fs::read_to_string(&dict_path).unwrap();
+        let mut expected = [
+            (joaat("health_max"), "health_max"),
+            (joaat("prop_crate_01"), "prop_crate_01"),
+            (joaat("spawn_point"), "spawn_point"),
+        ];
+        expected.sort_by_key(|(h, _)| *h);
+        let want: String = expected.iter().map(|(h, n)| format!("{h:#010x} {n}\n")).collect();
+        assert_eq!(text, want);
+        let reloaded = rpf9::hashes::Dict::load(Some(&dict_path)).unwrap();
+        for (h, n) in expected { assert_eq!(reloaded.name(h), Some(n)); }
+        let _ = std::fs::remove_file(&dict_path);
     }
 }

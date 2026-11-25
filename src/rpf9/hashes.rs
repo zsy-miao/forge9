@@ -1,7 +1,7 @@
 //! joaat hash dictionary: embedded known names plus optional external file.
 
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 const KNOWN: &[(u32, &str)] = &[
@@ -81,6 +81,37 @@ fn parse_lines(text: &str) -> impl Iterator<Item = (u32, String)> + '_ {
     })
 }
 
+/// Merges `entries` into `existing` (`hexhash name` lines), keeping existing names on conflict,
+/// deduplicating by hash and sorting ascending by hash. Returns `(formatted, added, total)`.
+pub fn merge_dict(existing: &str, entries: impl IntoIterator<Item = (u32, String)>) -> (String, usize, usize) {
+    let mut map: BTreeMap<u32, String> = parse_lines(existing).collect();
+    let mut added = 0;
+    for (hash, name) in entries {
+        let name = name.trim();
+        if name.is_empty() || name.contains(['\n', '\r']) { continue; }
+        map.entry(hash).or_insert_with(|| { added += 1; name.to_string() });
+    }
+    let mut out = String::new();
+    for (hash, name) in &map {
+        use std::fmt::Write;
+        let _ = writeln!(out, "{hash:#010x} {name}");
+    }
+    (out, added, map.len())
+}
+
+/// Merges `entries` into `path` (creating it if absent) as sorted, deduplicated `hexhash name`
+/// lines. Returns `(added, total)`.
+pub fn write_dict(path: &Path, entries: impl IntoIterator<Item = (u32, String)>) -> Result<(usize, usize)> {
+    let existing = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("reading dict {}", path.display())),
+    };
+    let (formatted, added, total) = merge_dict(&existing, entries);
+    std::fs::write(path, formatted).with_context(|| format!("writing dict {}", path.display()))?;
+    Ok((added, total))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,5 +127,18 @@ mod tests {
         let d = Dict::load(None).unwrap();
         assert_eq!(d.fmt(0xde396fe2), "0xde396fe2 (root_document)");
         assert_eq!(d.fmt(0x12345678), "0x12345678");
+    }
+
+    #[test]
+    fn merge_dict_dedups_sorts_and_preserves_existing() {
+        let existing = "# saved\n0x00000020 kept_name\n";
+        let (text, added, total) = merge_dict(existing, [
+            (0x00000020, "override_attempt".to_string()),
+            (0x00000030, "later".to_string()),
+            (0x00000010, "earlier".to_string()),
+            (0x00000010, "duplicate".to_string()),
+        ]);
+        assert_eq!((added, total), (2, 3));
+        assert_eq!(text, "0x00000010 earlier\n0x00000020 kept_name\n0x00000030 later\n");
     }
 }
