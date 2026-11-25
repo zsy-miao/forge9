@@ -114,9 +114,9 @@ far-apart edits in one non-XML file become one large span.
 
 A patched payload that replaces a zlib entry is stored as zlib (64 KiB chunks).
 Other payloads are stored raw. Nested archives are repacked from the inside
-out. Archives whose records store no entry size (the indexed layout) read a raw
-entry up to the next one, so a raw payload whose size changes reads back zero
-padded. `verify` and `apply` warn when a patched entry does not read back exactly.
+out. Each record gets the new stored and decoded size, so a raw payload reads
+back at its exact length. `verify` and `apply` warn when a patched entry does
+not read back exactly.
 Paged resources are not re-split on their original block boundaries.
 
 ## Example

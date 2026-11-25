@@ -13,10 +13,17 @@ prove a live load.
 
 - **`zeozeozeo/rpf9` v0.2.0** (commit `a201c47`), used through its public API
   (`Rpf::parse`, `entries`, `read`) by a small external harness. It has a
-  separate parser and decrypt path, and it inflates zlib entries and stitches
-  64 KiB pages across physically adjacent entries, which forge9's reader does
-  not do. It has no encryptor, so a TOC it accepts was encrypted by forge9 and
-  decrypted by different code.
+  separate parser and decrypt path. It inflates the first zlib stream of an
+  entry and, when that stream decodes to a multiple of 64 KiB, appends the
+  physically next entry ("page stitching"). It has no encryptor, so a TOC it
+  accepts was encrypted by forge9 and decrypted by different code.
+- **Its multi-part reads are wrong.** The 24-byte record declares each entry's
+  stored and decoded size, and a resource over 64 KiB keeps all its zlib parts
+  inside its own stored span ([rpf9_format.md](rpf9_format.md), "Multi-part
+  resources"). Stitching therefore returns the first part followed by an
+  unrelated neighbour for each of the 84 multi-part entries of `common.rpf`.
+  The comparisons below still hold for the other entries, and for those 84
+  they show only that both sides read the same bytes the same wrong way.
 - It is **not fully independent**. forge9's cipher and TOC record heuristic
   were ported from this crate, and both use the same `keys.bin`/`tables.bin`.
   Agreement shows that forge9's writer and this reader's model of the format
@@ -60,7 +67,8 @@ data start to 4 KiB, and packed entries at 16-byte alignment. As a result:
   6,642,192 bytes).
 - For **60 multi-page zlib entries**, the upstream reader's page stitching
   followed a different neighbour, so those resources decoded to different
-  content.
+  content. (Stitching is itself wrong, see above; the old order was still a
+  real bug, because it broke byte identity and alignment.)
 - In `script.rpf`, nested child #1 moved from `0xc4000` to `0xc3b90`, which
   lost its 4 KiB alignment.
 
@@ -121,14 +129,16 @@ loads the archive.
   (`docs/rpf9-format-findings.md`) describe a
   three-stage header transform, six record tables, per-chunk codec and length
   records, declared decoded lengths, and counter-mode encrypted members.
-  forge9 rewrites only the 24-byte record's offset word. Declared lengths and
-  codec flags are left at their original values. Changing an entry's decoded
-  length (for example, appending an XML comment) or storing a zlib entry raw
-  may therefore contradict the game's index even though both heuristic
-  readers accept it. Replacements should keep the original codec: compress
-  the replacement for a zlib entry.
-- **Raw entries have no explicit length** in the indexed record layout. A raw
-  replacement reads back with zero padding up to the next 16-byte boundary.
+  forge9 rewrites the 24-byte record's offset, stored size and decoded size
+  (the record layout is in [rpf9_format.md](rpf9_format.md), "24-byte
+  record"); the flags and the other columns are left at their original
+  values. Storing a zlib entry raw may therefore still contradict the game's
+  index. Replacements should keep the original codec: compress the
+  replacement for a zlib entry.
+- Before the record fix forge9 rewrote only the offset, so the size-change
+  tests in the table above left stale stored and decoded sizes in the records.
+  Both readers sized entries by the span to the next entry and accepted them;
+  the game's loader may not.
 
 ## Conclusion
 

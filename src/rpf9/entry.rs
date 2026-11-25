@@ -6,7 +6,12 @@ pub const RECORD: usize = 24;
 pub struct Entry {
     pub index: usize,
     pub offset: u64,
+    /// Stored bytes: the payload as it sits in the archive, raw or as a zlib chain.
     pub size: u64,
+    /// Declared content length (24-byte records only): what the payload inflates to, or its
+    /// unpadded length when raw.
+    pub decoded_size: Option<u64>,
+    /// Compact records only: `+0x00` and `+0x10`, meanings not established.
     pub size_hint: u32,
     pub aux: u32,
     pub flags: u32,
@@ -20,15 +25,22 @@ impl Entry {
         data.get(self.offset as usize..).is_some_and(zlib_head)
     }
 
+    /// Content length of a payload that is not a zlib chain: the decoded size when the stored
+    /// bytes are exactly that padded to 16, else the whole stored span (an unidentified codec).
+    pub fn raw_len(&self) -> u64 {
+        self.decoded_size.filter(|d| d.next_multiple_of(16) == self.size).unwrap_or(self.size)
+    }
+
     pub fn payload_magic(&self, data: &[u8]) -> Option<[u8; 4]> {
         let off = self.offset as usize;
         data.get(off..off + 4).map(|s| [s[0], s[1], s[2], s[3]])
     }
 }
 
-/// True if `data` starts with a zlib stream header.
+/// True if `data` starts with a zlib stream header. Every zlib part in the archives opens with
+/// CMF `0x78`; payloads of the unidentified codec can pass the bare header checksum.
 pub fn zlib_head(data: &[u8]) -> bool {
-    data.len() >= 2 && data[0] & 0x0f == 8 && ((u16::from(data[0]) << 8) | u16::from(data[1])) % 31 == 0
+    data.len() >= 2 && data[0] == 0x78 && u16::from_be_bytes([data[0], data[1]]) % 31 == 0
 }
 
 const GRAPH_MAGIC: [u8; 16] = [
@@ -40,53 +52,47 @@ pub fn has_graph_magic(plain: &[u8]) -> bool {
     plain.windows(GRAPH_MAGIC.len()).any(|w| w == GRAPH_MAGIC)
 }
 
-/// Decodes a record into `(byte offset, explicit size)`.
-///
-/// Two layouts share the 24-byte stride:
-/// - indexed (most archives): `{u32 size_hint, 0, u32 offset/16, u32 flags, u32 aux, 0}`
-/// - stored (e.g. script.rpf, whose entries are nested RPF9s):
-///   `{u64 offset/16, u64 ceil(size/16), u64 size}`: the middle field is a
-///   built-in check that the indexed layout never satisfies once flags are set.
-fn decode(bytes: &[u8]) -> Option<(u64, Option<u64>)> {
+/// Decodes a 24-byte record `{u32 offset/16, u32 flags, u64 stored size/16, u64 decoded size}`
+/// into `(byte offset, flags, stored bytes, decoded bytes)`. The decoded size is the exact
+/// content length: the inflated length of a zlib chain, or the unpadded length of a raw payload.
+fn decode(bytes: &[u8]) -> Option<(u64, u32, u64, u64)> {
     if bytes.len() < RECORD { return None; }
-    let quad = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
-    let (units, blocks, size) = (quad(0), quad(8), quad(16));
-    if units != 0 && size != 0 && blocks == size.div_ceil(16) {
-        return Some((units.saturating_mul(16), Some(size)));
-    }
     let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
-    if word(4) != 0 || word(20) != 0 || word(8) == 0 { return None; }
-    Some((u64::from(word(8)) * 16, None))
+    let quad = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+    let (units, stored) = (word(0), quad(8));
+    (units != 0 && stored != 0).then(|| (u64::from(units) * 16, word(4), stored.saturating_mul(16), quad(16)))
 }
 
-/// Rewrites a record's location in place, preserving its layout.
-pub fn encode_location(record: &mut [u8], offset: u64, size: u64) {
-    if matches!(decode(record), Some((_, Some(_)))) {
-        record[0..8].copy_from_slice(&(offset / 16).to_le_bytes());
-        record[8..16].copy_from_slice(&size.div_ceil(16).to_le_bytes());
-        record[16..24].copy_from_slice(&size.to_le_bytes());
-    } else {
-        record[8..12].copy_from_slice(&((offset / 16) as u32).to_le_bytes());
-    }
+/// Rewrites a record's location and sizes in place, keeping its flags.
+pub fn encode_location(record: &mut [u8], offset: u64, stored: u64, decoded: u64) {
+    record[0..4].copy_from_slice(&((offset / 16) as u32).to_le_bytes());
+    record[8..16].copy_from_slice(&stored.div_ceil(16).to_le_bytes());
+    record[16..24].copy_from_slice(&decoded.to_le_bytes());
 }
 
-pub fn detect(plain: &[u8], file_len: u64, declared: usize) -> (usize, usize) {
-    let limit = declared.saturating_add(2);
-    let mut best = (0usize, 0usize);
-    let mut start = 0usize;
-    while start + RECORD <= plain.len() {
-        let mut run = 0usize;
-        let mut at = start;
-        while at + RECORD <= plain.len() && run < limit {
-            let Some((offset, _)) = decode(&plain[at..]) else { break; };
-            if offset / 16 >= file_len { break; }
-            run += 1;
-            at += RECORD;
+/// Finds the 24-byte record table: the first 8-aligned start where `count` records in a row
+/// decode with payloads inside `data_start..end` that do not overlap and a decoded size under
+/// 4 GiB. `count` is the records
+/// column's own count when the column directory has it, else `declared`. Column data follows the
+/// directory, so the table starts no earlier than the last known descriptor's end plus the records
+/// column's offset from the shared base.
+pub fn detect(plain: &[u8], data_start: u64, end: u64, declared: usize) -> Option<(usize, usize)> {
+    let (count, rec_off) = column(plain, RECORDS).map_or((declared, 0), |(n, off, _)| (n, off));
+    if count == 0 { return None; }
+    let dir_end = COLUMN_IDS.iter().filter_map(|id| plain.windows(8).position(|w| w == id.to_le_bytes())).max().map_or(0, |at| at + 24);
+    let valid = |s: usize| {
+        let mut spans = Vec::with_capacity(count);
+        for i in 0..count {
+            let (offset, _, stored, decoded) = decode(&plain[s + i * RECORD..])?;
+            // ponytail: a decoded size of 4 GiB or more is taken as a misaligned start (an
+            // `offset | flags` word read as a size); lift it if an archive holds such an entry.
+            if offset < data_start || offset.saturating_add(stored) > end || decoded >> 32 != 0 { return None; }
+            spans.push((offset, stored));
         }
-        if run > best.1 { best = (start, run); }
-        start += 4;
-    }
-    best
+        spans.sort_unstable();
+        spans.windows(2).all(|w| w[0] == w[1] || w[0].0 + w[0].1 <= w[1].0).then_some(())
+    };
+    ((dir_end + rec_off).next_multiple_of(8)..).step_by(8).take_while(|&s| s + count * RECORD <= plain.len()).find(|&s| valid(s).is_some()).map(|s| (s, count))
 }
 
 /// Directory hash of the 20-byte entry section that content archives (e.g. the
@@ -122,6 +128,11 @@ pub fn detect_compact(plain: &[u8], data: &[u8], data_start: u64) -> Option<(usi
 /// 0x73bcb72dce74f11f) holds a further per-record value whose hash function is not identified.
 const RECORDS: u64 = 0x33f7_0dfa_f2c5_0989;
 const NAME_HASHES: u64 = 0xb707_6b62_45d3_5fb5;
+/// Every column id seen in a directory; the last one found bounds where the directory ends.
+const COLUMN_IDS: [u64; 8] = [
+    RECORDS, NAME_HASHES, 0xba18_0afb_232d_1b4b, 0x73bc_b72d_ce74_f11f,
+    0xe0c1_2d7a_5d48_84c5, 0xb6f5_bdb2_c66d_a2e9, 0x2860_30a3_58a7_89fb, 0x9045_6c0f_bc4d_5746,
+];
 
 /// `(count, offset, stride)` of column `id`.
 fn column(plain: &[u8], id: u64) -> Option<(usize, usize, u64)> {
@@ -156,6 +167,7 @@ pub fn parse_compact(plain: &[u8], table_at: usize, count: usize) -> Vec<Entry> 
                 index,
                 offset: units * 16 + COMPACT_PREFIX,
                 size: blocks * 16 - COMPACT_PREFIX,
+                decoded_size: None,
                 size_hint: w[0],
                 aux: w[4],
                 flags: w[1],
@@ -166,46 +178,14 @@ pub fn parse_compact(plain: &[u8], table_at: usize, count: usize) -> Vec<Entry> 
         .collect()
 }
 
-pub fn parse(plain: &[u8], table_at: usize, run: usize, count: usize, end: u64) -> Vec<Entry> {
-    let count = count.min(run);
-    let mut entries = Vec::with_capacity(count);
-    for index in 0..count {
-        let at = table_at + index * RECORD;
-        let Some(bytes) = plain.get(at..at + RECORD) else { break; };
-        let raw: [u8; RECORD] = bytes.try_into().unwrap();
-        let word = |o: usize| u32::from_le_bytes(raw[o..o + 4].try_into().unwrap());
-        let Some((offset, size)) = decode(&raw) else { continue; };
-        if offset >= end { continue; }
-        entries.push(Entry {
-            index,
-            offset,
-            size: size.unwrap_or(0),
-            size_hint: word(0),
-            aux: word(16),
-            flags: word(12),
-            name_hash: None,
-            raw,
-        });
-    }
-    assign_sizes(&mut entries, end);
-    entries
-}
-
-/// Fills unknown (zero) sizes with the span up to the next entry or `end`.
-pub fn assign_sizes(entries: &mut [Entry], end: u64) {
-    if entries.is_empty() { return; }
-    let mut order: Vec<usize> = (0..entries.len()).collect();
-    order.sort_by_key(|&i| entries[i].offset);
-    order.dedup_by_key(|&mut i| entries[i].offset);
-    for pair in order.windows(2) {
-        if entries[pair[0]].size == 0 {
-            entries[pair[0]].size = entries[pair[1]].offset.saturating_sub(entries[pair[0]].offset);
-        }
-    }
-    let last = *order.last().unwrap();
-    if entries[last].size == 0 {
-        entries[last].size = end.saturating_sub(entries[last].offset);
-    }
+pub fn parse(plain: &[u8], table_at: usize, count: usize) -> Vec<Entry> {
+    (0..count)
+        .filter_map(|index| {
+            let raw: [u8; RECORD] = plain.get(table_at + index * RECORD..table_at + (index + 1) * RECORD)?.try_into().unwrap();
+            let (offset, flags, size, decoded) = decode(&raw)?;
+            Some(Entry { index, offset, size, decoded_size: Some(decoded), size_hint: 0, aux: 0, flags, name_hash: None, raw })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -217,28 +197,35 @@ mod tests {
     }
 
     #[test]
-    fn stored_layout_uses_explicit_offset_and_size() {
-        // script.rpf record #0: nested RPF9 at 0x1000, 0xc2b90 bytes
+    fn records_carry_offset_stored_and_decoded_sizes() {
+        // script.rpf: two raw nested RPF9s, flags 0, stored = decoded rounded up to 16
         let plain = [quads([0x100, 0xc2b9, 0xc2b90]), quads([0xc400, 0x3642b, 0x3642b0])].concat();
-        let (start, run) = detect(&plain, 0x428330, 2);
-        assert_eq!((start, run), (0, 2));
-        let entries = parse(&plain, start, run, 2, 0x4282b0);
-        assert_eq!((entries[0].offset, entries[0].size), (0x1000, 0xc2b90));
-        assert_eq!((entries[1].offset, entries[1].size), (0xc4000, 0x3642b0));
+        assert_eq!(detect(&plain, 0x260, 0x4282b0, 2), Some((0, 2)));
+        let entries = parse(&plain, 0, 2);
+        assert_eq!((entries[0].offset, entries[0].size, entries[0].decoded_size), (0x1000, 0xc2b90, Some(0xc2b90)));
+        assert_eq!((entries[1].offset, entries[1].size, entries[1].decoded_size), (0xc4000, 0x3642b0, Some(0x3642b0)));
+    }
+
+    fn words(w: &[u64]) -> Vec<u8> {
+        w.iter().flat_map(|v| v.to_le_bytes()).collect()
     }
 
     #[test]
-    fn indexed_layout_spans_to_next_entry() {
-        let mut plain = vec![0u8; 2 * RECORD];
-        for (i, units) in [0x36u32, 0x100].iter().enumerate() {
-            let at = i * RECORD;
-            plain[at..at + 4].copy_from_slice(&4u32.to_le_bytes());
-            plain[at + 8..at + 12].copy_from_slice(&units.to_le_bytes());
-            plain[at + 12..at + 16].copy_from_slice(&0xff00u32.to_le_bytes());
-        }
-        let entries = parse(&plain, 0, 2, 2, 0x2270);
-        assert_eq!((entries[0].offset, entries[0].size), (0x360, 0xca0));
-        assert_eq!((entries[1].offset, entries[1].size), (0x1000, 0x1270));
+    fn two_part_record_found_behind_leading_words() {
+        // Shape of a script.rpf child: a u64 before the table, then a one-part and a two-part
+        // zlib entry. Flags 0xb00 share the first u64 with the offset; the two-part entry
+        // declares 0x184d0 decoded bytes (a 64 KiB part and a 0x84d0 part) in 0x6390 stored.
+        let flagged = |units: u64| units | 0xb00 << 32;
+        let plain = words(&[0xd4, flagged(0x1200), 0x190, 0x2580, flagged(0x2300), 0x639, 0x184d0]);
+        assert_eq!(detect(&plain, 0x260, 0x30000, 2), Some((8, 2)));
+        let entries = parse(&plain, 8, 2);
+        assert_eq!((entries[0].offset, entries[0].flags, entries[0].size, entries[0].decoded_size), (0x12000, 0xb00, 0x1900, Some(0x2580)));
+        assert_eq!((entries[1].offset, entries[1].size, entries[1].decoded_size), (0x23000, 0x6390, Some(0x184d0)));
+        assert_eq!(detect(&plain, 0x260, 0x22000, 2), None, "second payload past the end");
+        // script.rpf/0: two words that decode as a record in bounds, but whose decoded size is
+        // the real record's `offset | flags` word. The real table starts 16 bytes later.
+        let plain = words(&[0x1000, 4, 0x5200 | 0x6000 << 32, 0x70b5, 0x293c30]);
+        assert_eq!(detect(&plain, 0x260, 0xc2b90, 1), Some((16, 1)));
     }
 
     #[test]
@@ -280,14 +267,9 @@ mod tests {
     }
 
     #[test]
-    fn encode_location_roundtrips_both_layouts() {
-        let mut stored = quads([0x100, 0xc2b9, 0xc2b90]);
-        encode_location(&mut stored, 0x2000, 0x31);
-        assert_eq!(decode(&stored), Some((0x2000, Some(0x31))));
-        let mut indexed = vec![0u8; RECORD];
-        indexed[8] = 1;
-        indexed[12..16].copy_from_slice(&0xff00u32.to_le_bytes());
-        encode_location(&mut indexed, 0x3000, 0x99);
-        assert_eq!(decode(&indexed), Some((0x3000, None)));
+    fn encode_location_keeps_flags() {
+        let mut record = [quads([0x100 | 0xff00 << 32, 0x21, 0x6ed])].concat();
+        encode_location(&mut record, 0x3000, 0x2a0, 0x900);
+        assert_eq!(decode(&record), Some((0x3000, 0xff00, 0x2a0, 0x900)));
     }
 }

@@ -66,6 +66,10 @@ pub fn replace_zlib_inplace(
 
     let start = entry.offset as usize;
     let old_size = entry.size as usize;
+    // The TOC is left as is, so the record's decoded size must stay true.
+    if let Some(d) = entry.decoded_size.filter(|&d| d != new_data.len() as u64) {
+        bail!("entry #{entry_index} declares {d} decoded bytes, replacement is {}: use `repack` to change the length", new_data.len());
+    }
 
     let mut compressed = zlib_chain(new_data)?;
     if compressed.len() > old_size {
@@ -143,64 +147,63 @@ pub fn repack_bytes(
         }
     }
 
-    let entries = archive.entries();
-    let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(entries.len());
-    for entry in entries {
-        if let Some(new_data) = replacements.get(&entry.index) {
-            payloads.push(new_data.clone());
-        } else {
-            let start = entry.offset as usize;
-            let end = (start + entry.size as usize).min(original.len());
-            payloads.push(original[start..end].to_vec());
-        }
-    }
-
-    // Lay payloads out in their original physical order, so multi-page zlib
-    // streams stay adjacent and an unchanged archive repacks byte-identically.
+    // Lay payloads out in their original physical order, so an unchanged archive repacks
+    // byte-identically. An unchanged entry brings its whole original slot, up to the next entry,
+    // so gaps and unreferenced bytes survive; bytes before the first entry are kept too.
     // `data_region` holds the bytes from `toc_end` on.
+    let entries = archive.entries();
+    let archive_end = original.len() - header.trailer_size as usize;
     let mut order: Vec<usize> = (0..entries.len()).collect();
     order.sort_by_key(|&i| entries[i].offset);
-    let mut data_region = Vec::new();
+    let first = order.first().map_or(archive_end, |&i| entries[i].offset as usize);
+    let mut data_region = original[toc_end..first].to_vec();
     let mut new_offsets = vec![0u64; entries.len()];
     let mut new_sizes = vec![0u64; entries.len()];
 
-    for &i in &order {
+    for (k, &i) in order.iter().enumerate() {
+        let entry = &entries[i];
         // ponytail: alignment inferred from the original offset, capped at 4 KiB; the real rule is unknown
-        let align = 1usize << entries[i].offset.trailing_zeros().min(12);
+        let align = 1usize << entry.offset.trailing_zeros().min(12);
         let pos = (toc_end + data_region.len()).next_multiple_of(align);
         data_region.resize(pos - toc_end, 0);
         new_offsets[i] = pos as u64;
-        new_sizes[i] = payloads[i].len() as u64;
-        data_region.extend_from_slice(&payloads[i]);
+        if let Some(new_data) = replacements.get(&entry.index) {
+            new_sizes[i] = new_data.len() as u64;
+            data_region.extend_from_slice(new_data);
+        } else {
+            let start = entry.offset as usize;
+            let next = order[k + 1..].iter().map(|&j| entries[j].offset as usize).find(|&o| o > start).unwrap_or(archive_end);
+            new_sizes[i] = entry.size;
+            data_region.extend_from_slice(&original[start..next.max(start + entry.size as usize)]);
+        }
         let pad = (16 - (data_region.len() % 16)) % 16;
         data_region.resize(data_region.len() + pad, 0);
     }
 
-    // Rebuild 24-byte entry records in plaintext TOC
-    let archive_total = toc_end as u64 + data_region.len() as u64 + header.trailer_size as u64;
-    let (entry_start, run) = crate::rpf9::entry::detect(
-        &toc_plain, archive_total, header.entry_count as usize,
-    );
-    if run < entries.len() {
+    // Rebuild 24-byte entry records in plaintext TOC; an unchanged entry keeps its decoded size.
+    let Some((entry_start, count)) = crate::rpf9::entry::detect(
+        &toc_plain, toc_end as u64, archive_end as u64, header.entry_count as usize,
+    ).filter(|&(_, n)| n == entries.len()) else {
         bail!("TOC layout has no 24-byte entry records to rewrite (compact content archive?): repack unsupported");
-    }
-    let skip = if header.entry_count > 0 && run == header.entry_count as usize + 1 { 1 } else { 0 };
-
-    for (i, _entry) in entries.iter().enumerate() {
-        let record_at = entry_start + (i + skip) * crate::rpf9::entry::RECORD;
-        if record_at + crate::rpf9::entry::RECORD > toc_plain.len() { break; }
+    };
+    for (i, entry) in entries.iter().enumerate().take(count) {
+        let decoded = match replacements.get(&entry.index) {
+            Some(data) => crate::rpf9::reader::decode(data)?.len() as u64,
+            None => entry.decoded_size.unwrap_or(new_sizes[i]),
+        };
+        let record_at = entry_start + i * crate::rpf9::entry::RECORD;
         crate::rpf9::entry::encode_location(
             &mut toc_plain[record_at..record_at + crate::rpf9::entry::RECORD],
             new_offsets[i],
             new_sizes[i],
+            decoded,
         );
     }
 
     let mut toc_cipher = toc_plain;
     schedule.encrypt_cbc(&mut toc_cipher, &TAG_IV);
 
-    let trailer_start = original.len() - header.trailer_size as usize;
-    let trailer = &original[trailer_start..];
+    let trailer = &original[archive_end..];
 
     let mut out = Vec::with_capacity(toc_end + data_region.len() + trailer.len());
     out.extend_from_slice(&original[..HEADER_SIZE]);

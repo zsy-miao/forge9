@@ -66,7 +66,7 @@ field.
 | `0x1C` | u32 | `gen_const` | UNKNOWN | Read and preserved, used nowhere. |
 | `0x20` | u16 | `version_low` | PARTLY KNOWN | Printed as the minor part of `version high.low`. Not checked. |
 | `0x22` | u16 | `version_high` | PARTLY KNOWN | Printed as the major part. Not checked. |
-| `0x24` | u32 | `entry_count` | KNOWN | Declared number of entries. Used as the target for record detection: a run of exactly `entry_count + 1` records means the first record is skipped, and `0` means "trust the detected run" (`reader.rs`). |
+| `0x24` | u32 | `entry_count` | PARTLY KNOWN | Declared number of entries. Equals the records column's count in every archive checked but one: `script.rpf/0` declares 2 and its records column holds 1 ([What is still unknown](#what-is-still-unknown)). Record detection uses the column's count and falls back to this value only when the TOC has no records column. |
 | `0x28` | u32 | `key_id` | UNKNOWN (mapping) | Printed, but **not** used to pick a key. forge9 finds the key by trial ([Key selection](#key-selection)). How `key_id` maps to a key slot, if it does, is not established. |
 | `0x2C` | u32 | `flags` | UNKNOWN | `Header::entry_stride` reports `8 + (flags & 0xFF)` and `info` prints it as "stride", but no parser uses that value and it is not verified against the real record strides. The other bits are not identified. |
 | `0x30` | u32 | `alignment` | UNKNOWN (use) | Read and preserved. forge9's writer does not use it: payload alignment on repack is inferred from each original offset ([Writing archives](#writing-archives)). |
@@ -138,7 +138,11 @@ archives decrypt with the same 9 keys.
 `entry.rs` also defines a 16-byte marker, `GRAPH_MAGIC`: u64 `0x40` immediately
 followed by the records column id `0x33f70dfaf2c50989`. The repack validation
 harness uses its presence in the plaintext as evidence that the right key was
-found. Why `0x40` precedes the id is UNKNOWN.
+found. KNOWN: the `0x40` is the stride field of the column descriptor just
+before the records descriptor, column `0x286030a358a789fb` (stride 64), which
+`common.rpf`, `appdata0.rpf` and `script.rpf/0` have. Directories without that
+column (`script.rpf/1`, the top level of `story000_restofworld.rpf`) do not
+contain the marker.
 
 ## The TOC column system
 
@@ -170,60 +174,87 @@ is a heuristic: an id could in principle also occur inside data.
 
 | Column id | Stride | Element | Status | Used by forge9 |
 |---|---|---|---|---|
-| `0x33f70dfaf2c50989` | 24 | Entry record, indexed or stored layout | KNOWN | Records are found by scanning, not via this descriptor; its offset anchors the name column. Also part of `GRAPH_MAGIC`. |
+| `0x33f70dfaf2c50989` | 24 | Entry record, 24-byte layout | KNOWN | Records are found by scanning, not via this descriptor; its offset anchors the name column. Also part of `GRAPH_MAGIC`. |
 | `0xba180afb232d1b4b` | 20 | Entry record, compact layout (nested content archives) | KNOWN | `detect_compact` reads its count; records are then found by scanning. Anchors the name column for compact archives. |
 | `0xb7076b6245d35fb5` | 4 | u32 joaat of the entry's name, one per record index | KNOWN | `name_hashes` reads it (only when the descriptor's stride is 4). |
 | `0x73bcb72dce74f11f` | 8 | u64 per-record value, apparently a 64-bit hash | UNKNOWN (function) | Not read. The hash function that produces it is not identified. |
 | `0xe0c12d7a5d4884c5` | 8 | 8-byte per-record value | UNKNOWN | Not read; seen in column directories, not parsed or checked by forge9 code. |
-| `0xb6f5bdb2c66da2e9` | not recorded | not identified | UNKNOWN | Not read; seen in column directories, not parsed or checked by forge9 code. |
+| `0xb6f5bdb2c66da2e9` | field reads `0x10008` | not identified | UNKNOWN | Not read. Its descriptor gives offset 0 and the stride field `0x10008`, unlike every other column. The bytes between the end of the directory and the base fit 8 to 10 bytes per record (`common.rpf`: 4,184 bytes for 418 records; `script.rpf/1`: 8,096 for 1,012), so this may be that region; not verified. |
+| `0x286030a358a789fb` | 64 | 64-byte element, not identified | UNKNOWN (content) | Not read. When present it is the first column (offset 0), placed just before the records: `common.rpf` 32 elements, `appdata0.rpf` 2, `script.rpf/0` 1. Its descriptor's stride is the `0x40` of `GRAPH_MAGIC`. |
+| `0x90456c0fbc4d5746` | field reads `0x10008` | not identified | UNKNOWN | Not read; seen once, in `script.rpf/1` (count 1). Used only to find where the directory ends. |
+
+KNOWN (measured): the columns lie **back to back from the base**, each
+`count * stride` bytes. In `common.rpf` (418 records) the offsets are
+`0x286030a358a789fb` at `0x0` (32 x 64), records at `0x800`, `0x73bcb72dce74f11f`
+at `0x2f30`, names at `0x3c40` and `0xe0c12d7a5d4884c5` at `0x42c8`, which are
+exactly the running sums. The base itself comes after the directory and a
+variable-length region (see `0xb6f5bdb2c66da2e9`); where that region ends is not
+yet derived, so forge9 still finds the records by scanning and uses the base
+only through offset differences.
 
 `rpf9-explorer`'s notes describe "six record tables" in the index
-(see [repack_validation.md](repack_validation.md), "Limits"). Six column ids
-are listed above, which is consistent with that count; the correspondence is
-not verified.
+(see [repack_validation.md](repack_validation.md), "Limits"). Eight column ids
+are listed above; the correspondence is not verified.
 
 ## Record layouts
 
-Three record layouts exist. Indexed and stored share the 24-byte stride of
-column `0x33f70dfaf2c50989`; compact is the 20-byte column
-`0xba180afb232d1b4b`. No layout carries the name hash: that lives in its own
-column.
+Two record layouts exist: the 24-byte record of column `0x33f70dfaf2c50989`
+and the 20-byte compact record of column `0xba180afb232d1b4b`. Neither carries
+the name hash: that lives in its own column.
 
-### Indexed record (24 bytes)
+### 24-byte record
 
-Used by most archives (`common.rpf`, `appdata0.rpf`, `shaders.rpf`). Decoded
-by `decode` in `entry.rs`.
-
-| Offset | Size | Field | Status | Meaning |
-|---|---|---|---|---|
-| `+0x00` | u32 | `size_hint` | PARTLY KNOWN | Kept as `Entry::size_hint`; not used to size the entry. Its exact meaning (declared decoded length, codec info or other) is UNKNOWN. |
-| `+0x04` | u32 | (zero) | KNOWN | Must be 0 for the record to decode as indexed. |
-| `+0x08` | u32 | offset / 16 | KNOWN | Payload byte offset in 16-byte units. Must be nonzero. The only word repack rewrites. |
-| `+0x0C` | u32 | `flags` | UNKNOWN | Kept as `Entry::flags` and printed by `list --json`. Bit meanings not identified. |
-| `+0x10` | u32 | `aux` | UNKNOWN | Kept as `Entry::aux`. |
-| `+0x14` | u32 | (zero) | KNOWN | Must be 0. |
-
-KNOWN: the indexed record stores **no explicit size**. forge9 sizes an entry as
-the span to the next entry in physical (offset) order, and the last one up to
-`file_len - trailer_size` (`assign_sizes`). A raw payload therefore reads back
-with its zero padding to the next entry; zlib payloads end where the zlib chain
-ends.
-
-### Stored record (24 bytes)
-
-Used where entries are nested RPF9s stored raw (for example `script.rpf`).
+Used by every archive with a records column (`common.rpf`, `appdata0.rpf`,
+`script.rpf` and its children, `shaders.rpf`, the top level of a story content
+pack). Decoded by `decode` in `entry.rs`.
 
 | Offset | Size | Field | Status | Meaning |
 |---|---|---|---|---|
-| `+0x00` | u64 | offset / 16 | KNOWN | Payload byte offset in 16-byte units. Nonzero. |
-| `+0x08` | u64 | ceil(size / 16) | KNOWN | Size in units, rounded up. |
-| `+0x10` | u64 | size | KNOWN | Exact payload size in bytes. Nonzero. |
+| `+0x00` | u32 | offset / 16 | KNOWN | Payload byte offset in 16-byte units. Nonzero. |
+| `+0x04` | u32 | `flags` | UNKNOWN (bits) | Kept as `Entry::flags`. Observed values: `0` (raw nested archives in `script.rpf`, raw entries in a story pack), `0xff00` (most of `common.rpf` and `appdata0.rpf`), `0xb00` (the PSIN entries of `script.rpf/1`), `0x6000` (`script.rpf/0`). They do not tell raw from zlib: both kinds occur with `0xff00`. |
+| `+0x08` | u64 | stored size / 16 | KNOWN | Bytes the payload occupies in the archive, in 16-byte units. For a zlib payload this covers the whole chain, every part and the padding after the last one. |
+| `+0x10` | u64 | decoded size | KNOWN | Exact content length in bytes: what a zlib chain inflates to (all parts together), or the unpadded length of a raw payload. |
 
-KNOWN: the middle field is a built-in check. A record is read as stored when
-`units != 0`, `size != 0` and `blocks == ceil(size / 16)`; otherwise it is
-tried as indexed. Once an indexed record has flags set, it cannot satisfy this
-check, which is how the two 24-byte layouts are told apart. Unit test:
-`stored_layout_uses_explicit_offset_and_size`.
+The record is three u64 words, `{offset/16 | flags << 32, stored/16, decoded}`.
+For a raw payload with flags `0` this reads `{offset/16, ceil(size/16), size}`,
+which is why it was first described as a separate "stored" layout.
+
+Measured on every 24-byte record of `script.rpf`, `common.rpf`, `appdata0.rpf`
+and the 24-byte tables of `story000_restofworld.rpf` (1,495 records):
+
+| Payload | Records | Rule that holds for all of them |
+|---|---|---|
+| zlib chain | 1,301 | The chain ends exactly at `offset + stored`, and inflates to exactly `decoded` |
+| raw | 43 | `stored == ceil(decoded / 16) * 16`; the content is the first `decoded` bytes |
+| no zlib head, `stored < decoded` | 151 | Not decoded: an unidentified codec or encryption (149 in `common.rpf`, 2 in `appdata0.rpf`) |
+
+`shaders.rpf` (3 records, listed but not measured part by part) has one more
+payload of the unidentified kind: entry 1, stored 137,521,488 bytes, decoded
+275,540,780.
+
+**Correction.** forge9 used to scan for this record 8 bytes too early. It
+read `{u32 size_hint, 0, u32 offset/16, u32 flags, u32 aux, 0}`, so its
+`size_hint` was the **previous** record's decoded size and its `aux` was the
+record's stored size in units. Consequences, all fixed by reading the record
+at its true start:
+
+- Every entry with nonzero flags was sized as the span to the next entry
+  instead of by its stored size, and no declared decoded size was read.
+  (Records with flags `0` happened to decode correctly.)
+- `script.rpf/1`'s first record (a PSIN at `0x12000`) was not recovered,
+  because the 8 bytes before the table are not zero; its 1,011 other entries
+  were numbered one lower than their record index (`1/9` is now `1/10`). In
+  `script.rpf/0` the one entry is now `0/0` (was `0/1`).
+- The "leading record skipped when the run is `entry_count + 1`" was this
+  misalignment: the scan's first window started before the table.
+- The name hash column was read from a base 8 or 16 bytes off, so entries of
+  24-byte archives got the hash of another record (2 records off in
+  `common.rpf`, 3 in `script.rpf/1`). Compact archives,
+  which the naming evidence in [Entry names](#entry-names-and-recovery) comes
+  from, were not affected.
+
+Unit tests: `records_carry_offset_stored_and_decoded_sizes`,
+`two_part_record_found_behind_leading_words`, `encode_location_keeps_flags`.
 
 ### Compact record (20 bytes)
 
@@ -232,7 +263,7 @@ Used by the nested RPF9s inside story and level content packs. Parsed by
 
 | Offset | Size | Field | Status | Meaning |
 |---|---|---|---|---|
-| `+0x00` | u32 | `size_hint` | PARTLY KNOWN | As in the indexed record. |
+| `+0x00` | u32 | `size_hint` | PARTLY KNOWN | In 441 of the 447 compact zlib payloads of a story content pack, `size_hint & !0xF` is the inflated length (97 match it exactly). The low 4 bits and the other 6 are not explained. |
 | `+0x04` | u32 | `flags` | UNKNOWN | Kept as `Entry::flags`. |
 | `+0x08` | u32 | size / 16 | KNOWN | Stored span in 16-byte units, **including** the 16-byte prefix. |
 | `+0x0C` | u32 | offset / 16 | KNOWN | Byte offset of the prefix, in units. |
@@ -245,23 +276,29 @@ the prefix is for is UNKNOWN. Unit test: `compact_layout_from_directory`.
 
 ### Record detection
 
-forge9 does not locate the records through the column directory. It scans
-(`detect`, `detect_compact`):
+forge9 does not yet read the record offset from the column directory, because
+the base is not located ([The TOC column system](#the-toc-column-system)). It
+scans (`detect`, `detect_compact`):
 
-- **24-byte layouts:** at every 4-byte step of the plaintext, count the run of
-  consecutive records that decode (stored or indexed) with an offset inside the
-  file, up to `entry_count + 2`; keep the longest run. A run of exactly
-  `entry_count + 1` means one leading record precedes the entries and is
-  skipped. What that leading record is, is UNKNOWN.
+- **24-byte records:** `count` is the records column's own count (the header's
+  `entry_count` only when there is no records column). The table is the first
+  8-aligned start, at or after the end of the last known column descriptor plus
+  the records column's offset, where `count` records in a row have a nonzero
+  offset and stored size, a payload inside `payload_start .. file_len -
+  trailer_size`, a decoded size below 4 GiB, and no two payloads overlapping.
+  The 4 GiB bound rejects a start where an `offset | flags` word lands in a
+  size field (it happens in `script.rpf/0`, 16 bytes before the table). It is
+  a stated ceiling, not a format rule.
 - **Compact layout**, tried only when the 24-byte run falls short of
   `entry_count`: take `count` from the `0xba180afb232d1b4b` descriptor, then
   find the first 8-aligned start after the descriptor where `count` records in
   a row are valid: span of more than one unit, prefix at or after
   `payload_start`, inside the file, and a zero 16-byte prefix.
 
-This works on every archive forge9 has opened, but it is a heuristic. Reading
-the record offset straight from the descriptor, relative to the shared base,
-would replace it once the base is identified.
+This finds the table at its true start in every archive checked (`common.rpf`
+`0x1a58`, `script.rpf/1` `0x21a0`, `script.rpf/0` `0x268`), but it is a
+heuristic. Reading the record offset straight from the descriptor, relative to
+the shared base, would replace it once the base is identified.
 
 ## Entry names and recovery
 
@@ -292,6 +329,11 @@ else candidate strings from the archives whose joaat matches. A candidate is
 only a 32-bit match and can be a collision; the JSON output carries an
 `evidence` field for each name.
 
+For 24-byte archives the name column is read from the corrected table start
+since the record fix ([24-byte record](#24-byte-record)); the column then
+begins exactly where the directory puts it (`common.rpf`: `32 * 418` bytes after
+the records, past the `0x73bcb72dce74f11f` column).
+
 UNKNOWN: whether the hashed string is a bare name, a name with extension, or a
 path; and what 64-bit hash fills column `0x73bcb72dce74f11f` (a likely second
 name or path hash, unconfirmed).
@@ -303,8 +345,12 @@ Code: `Archive::read_entry_blocks`, `inflate_zlib_chain`, `sniff_ext` in
 
 KNOWN:
 
-- A payload is either **raw** or a **zlib chain**. It counts as zlib when its
-  first two bytes form a valid zlib header (`zlib_head`).
+- A payload is **raw**, a **zlib chain**, or of an unidentified kind (see the
+  table in [24-byte record](#24-byte-record)). It counts as zlib when it
+  starts with CMF `0x78` and a valid zlib header checksum (`zlib_head`). Every
+  zlib part in the checked archives starts with `0x78`; 4 payloads of the
+  unidentified kind in `common.rpf` pass the bare checksum but not the `0x78`
+  test, and forge9 used to return them as empty.
 - A zlib chain is a sequence of independent zlib streams. forge9 inflates one
   stream, advances by the bytes it consumed, rounds up to the next 16-byte
   boundary, and continues while the next byte is `0x78`. forge9's writer
@@ -313,24 +359,65 @@ KNOWN:
 - Paged resources keep their system and graphics pages on stream boundaries,
   so `read_entry_blocks` returns the streams separately. Page layout:
   [drawable_format.md](drawable_format.md).
-- **Page stitching.** Some multi-page resources continue across physically
-  adjacent entries. The independent reader used for validation stitches 64 KiB
-  pages across those neighbours; forge9's reader does not stitch and reads
-  each entry on its own span. forge9's writer keeps the original physical
-  order so the neighbours stay adjacent (see [Writing archives](#writing-archives)).
-  How the next page is located, and what marks a continued entry, is UNKNOWN.
-- **Nesting.** An entry whose (inflated) content starts with `9FPR` is an RPF9
-  and opens with the same reader, the same keys and the same IV. `list
-  --recursive`, `tree`, `stats`, `diff` and `catalog` descend into them; every
-  entry-taking command accepts `a/b` paths. Observed nesting: `script.rpf`
-  holds 2 nested RPF9s (stored records, 4 KiB aligned); a story content pack
-  holds 18 nested archives (compact records, 465 entries in all).
+
+### Multi-part resources
+
+KNOWN, measured on all 1,301 zlib payloads with 24-byte records:
+
+- A resource whose content is larger than 64 KiB is stored as **one zlib
+  stream (part) per 64 KiB of content**, all inside the entry's own stored
+  span. Part `k` decodes to bytes `k * 0x10000 ..` of the content; every part
+  but the last decodes to exactly `0x10000` bytes.
+- Part 0 starts at the payload offset. Each next part starts at the first
+  16-byte boundary (relative to the payload start) after the previous stream's
+  last byte. The bytes in between are zero.
+- The chain ends exactly at `offset + stored` (the record's `+0x08` field),
+  after zero padding to 16. The record's decoded size (`+0x10`) is the sum of
+  all parts.
+- So a reader knows how many parts to expect from the record alone:
+  `ceil(decoded / 0x10000)`. There is no separate marker field, and no flag
+  value tells single-part from multi-part entries (the flags are the same for
+  both).
+- **No resource continues into the next entry.** For every multi-part entry
+  the parts inside its own span already add up to the declared decoded size.
+  The physically next entry is an unrelated payload with its own record.
+
+Counts: 89 multi-part entries (84 in `common.rpf`, 4 in `script.rpf`, 1 in
+`story000_restofworld.rpf`); 31 have exactly two parts; the largest has 218.
+None has a decoded size that is an exact multiple of 64 KiB. Example,
+`script.rpf/1/10` (PSIN): stored `0x6390`, decoded `0x184d0`; part 0 at `+0x0`
+decodes to `0x10000`, part 1 at `+0x1f70` decodes to `0x84d0`, and the chain
+ends at `+0x6390`.
+
+`read_entry_blocks` returns the parts separately and fails when they do not add
+up to the declared size ("entry #N inflates to X bytes in K parts, but its
+record declares Y"), so a missing or truncated part is reported instead of
+being cut silently. Unit test: `two_part_entry_reads_both_parts_from_its_own_span`.
+
+The independent reader used for validation (`zeozeozeo/rpf9` v0.2.0,
+`Rpf::read`) inflates only the first stream of an entry and, when that stream
+decodes to a multiple of 64 KiB, appends the physically next entry instead of
+the entry's second part. By the records above, that "page stitching" returns
+the wrong content for every multi-part entry. See
+[repack_validation.md](repack_validation.md).
+
+### Nesting and payload kinds
+
+- An entry whose (inflated) content starts with `9FPR` is an RPF9 and opens
+  with the same reader, the same keys and the same IV. `list --recursive`,
+  `tree`, `stats`, `diff` and `catalog` descend into them; every entry-taking
+  command accepts `a/b` paths. Observed nesting: `script.rpf` holds 2 nested
+  RPF9s (raw, flags 0, 4 KiB aligned); a story content pack holds 18 nested
+  archives with 468 entries in all (14 with compact records, 4 with 24-byte
+  records).
 - Payload kinds are detected by magic only (`sniff_ext`): `9FPR`, `PSIN`,
   `RBF0`, `ADAT`, `SGD5`, `RDS5`, `GFX\0`/`CFX\0`, XML, `0DRP`, `KB2`, `DDS `,
   PNG. Entry flags are not used for typing.
 
-UNKNOWN: whether any record field declares the codec or the decoded length
-(`size_hint` is a candidate), and any codec other than zlib in the container.
+UNKNOWN: the codec of the 151 payloads that are smaller than their declared
+decoded size but have no zlib head (`rpf9-explorer`'s notes mention
+counter-mode encrypted members; whether these are those is not checked), and
+whether any record field declares the codec.
 
 ## Writing archives
 
@@ -341,26 +428,35 @@ KNOWN:
 - **In-place replacement** (`replace_inplace`, `replace_zlib_inplace`) swaps a
   payload of the same stored size and leaves the TOC ciphertext untouched; a
   zlib replacement is recompressed and zero-padded to the original size.
-- **Repack** (`repack_bytes`): decrypt the TOC with the archive's key, lay
-  payloads out in their **original physical order**, each at the alignment of
-  its original offset (capped at 4 KiB) and padded to 16 bytes, rewrite each
-  record's location with `encode_location`, re-encrypt the TOC with the same
-  key and `TAG_IV`, and write the original header bytes, the new TOC, the data
-  and the original trailer.
-- `encode_location` keeps the layout: an indexed record has only its offset
-  word (`+0x08`) rewritten; a stored record has all three u64 fields rewritten.
+- In-place zlib replacement is refused when the new content's length differs
+  from the record's decoded size, since the TOC is not rewritten.
+- **Repack** (`repack_bytes`): decrypt the TOC with the archive's key, keep the
+  bytes between the TOC and the first entry, lay payloads out in their
+  **original physical order**, each at the alignment of its original offset
+  (capped at 4 KiB) and padded to 16 bytes, rewrite each record with
+  `encode_location`, re-encrypt the TOC with the same key and `TAG_IV`, and
+  write the original header bytes, the new TOC, the data and the original
+  trailer. An unchanged entry is copied with its whole original slot, up to the
+  next entry, so gaps and bytes no record covers are kept (`script.rpf/0` holds
+  about 264 KiB at `0x10000` that no 24-byte record points to).
+- `encode_location` rewrites the offset (`+0x00`), the stored size (`+0x08`)
+  and the decoded size (`+0x10`), and keeps the flags. A replaced entry's
+  decoded size is computed from the replacement (inflated if it is a zlib
+  chain); an unchanged entry keeps its declared value.
 - An **identity repack is byte-identical** on `common.rpf` (418 entries),
   `appdata0.rpf`, `script.rpf` and `shaders.rpf`, which proves the encryptor
-  exactly inverts the decryptor for those keys.
+  exactly inverts the decryptor for those keys. After the record fix this was
+  rechecked on `common.rpf`, `appdata0.rpf`, `script.rpf` and both of
+  `script.rpf`'s children (1 and 1,012 entries); growing the two-part
+  `script.rpf/1/10` to three parts repacks and passes `--verify`.
 - Archives with **compact** records are refused by repack ("repack
   unsupported") rather than written with stale offsets.
 - `repack --verify` and `mod apply --verify` reopen the output and compare
   every entry with the source.
 
 UNKNOWN: the real alignment rule (the `alignment` header field is not used;
-the writer's rule is an inference marked in the code); and whether `size_hint`,
-`flags` or the unread columns must change when a payload's size or codec
-changes.
+the writer's rule is an inference marked in the code); and whether `flags` or
+the unread columns must change when a payload's size or codec changes.
 
 ## Integrity and signatures
 
@@ -401,21 +497,30 @@ a meaning that is not established.
 **TOC**
 
 10. Where the shared base of the column offsets is, so the records can be read
-    from their descriptor instead of by scanning.
-11. The leading record skipped when the run is `entry_count + 1`.
-12. Column `0x73bcb72dce74f11f` (stride 8): the 64-bit hash function and the
+    from their descriptor instead of by scanning. Narrowed: the columns are
+    packed back to back from the base, and the base follows the directory and
+    a variable region of 8 to 10 bytes per record; that region's length rule is
+    not derived.
+11. Column `0x73bcb72dce74f11f` (stride 8): the 64-bit hash function and the
     string it hashes.
-13. Column `0xe0c12d7a5d4884c5` (stride 8): content.
-14. Column `0xb6f5bdb2c66da2e9`: stride and content.
+12. Column `0xe0c12d7a5d4884c5` (stride 8): content.
+13. Column `0xb6f5bdb2c66da2e9`: its `0x10008` stride field and content, and
+    whether it is the region before the base.
+14. Columns `0x286030a358a789fb` (64-byte elements) and `0x90456c0fbc4d5746`:
+    content.
 15. Short or missing name-hash columns: why some archives declare fewer name
     hashes than records, or none.
-16. Whether the six columns are the "six record tables" of `rpf9-explorer`'s
+16. Whether these columns are the "six record tables" of `rpf9-explorer`'s
     notes, and whether more exist.
+17. Why `script.rpf/0` declares 2 entries in its header with 1 record, and what
+    the roughly 264 KiB at `0x10000` that no 24-byte record points to are (one
+    64-byte element of `0x286030a358a789fb` there holds the words `0x1000`,
+    `0x1000`, `0x31000`; not interpreted).
 
 **Records**
 
-17. `size_hint`: exact meaning (declared decoded length is the leading guess).
-18. Record `flags` and `aux` in the indexed and compact layouts.
+18. Record `flags` bits (24-byte and compact layouts), and the compact layout's
+    `aux` and the low 4 bits of its `size_hint` (see [Compact record](#compact-record-20-bytes)).
 19. The 16 zero bytes before every compact payload.
 
 **Names**
@@ -425,18 +530,25 @@ a meaning that is not established.
 
 **Payloads and writing**
 
-21. How a multi-page resource continues into the physically next entry, and
-    what marks it.
-22. Any declared codec or decoded length in the index; any codec besides zlib.
-23. The real payload alignment rule.
-24. Which index fields the game requires to change when a payload's size or
-    codec changes.
+21. The codec of the 151 payloads stored smaller than their declared decoded
+    size without a zlib head, and whether any index field declares the codec.
+22. The real payload alignment rule.
+23. Which index fields besides offset, stored size and decoded size the game
+    requires to change when a payload's size or codec changes.
 
 **Integrity**
 
-25. Whether the running game rejects an archive whose header signature no
+24. Whether the running game rejects an archive whose header signature no
     longer matches (no runtime test yet).
-26. The cipher's lineage (naming only).
+25. The cipher's lineage (naming only).
+
+Resolved by the 24-byte record decode (see [24-byte record](#24-byte-record)
+and [Multi-part resources](#multi-part-resources)): the meaning of the old
+`size_hint` and `aux` (the previous record's decoded size and this record's
+stored size), the "leading record" skipped by the old scan, the declared decoded
+length, and how a multi-page resource continues (it does not continue into the
+next entry: every part is inside the entry's own stored span, and the record's
+sizes account for all of them).
 
 ## Format index
 
