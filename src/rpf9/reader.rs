@@ -21,46 +21,29 @@ impl<'a> Archive<'a> {
         }
         let ciphertext = &data[HEADER_SIZE..end];
         let declared = header.entry_count as usize;
+        let archive_end = (data.len() as u64).saturating_sub(u64::from(header.trailer_size));
 
+        // The key whose plaintext holds the record table (24-byte, else compact) with the most entries.
         let mut best: Option<(usize, usize, Vec<u8>, bool)> = None;
         let mut best_key = 0;
         for index in 0..crypto.key_count() {
             let schedule = crypto.schedule(index)?;
             let mut plain = ciphertext.to_vec();
             schedule.decrypt_cbc(&mut plain, &TAG_IV);
-            let (mut start, mut run) = entry::detect(&plain, data.len() as u64, declared);
-            let mut compact = false;
-            if run < declared {
-                if let Some((s, r)) = entry::detect_compact(&plain, data, end as u64) {
-                    if r > run { (start, run, compact) = (s, r, true); }
-                }
-            }
-            let replace = match &best {
-                None => true,
-                Some((best_run, ..)) => run > *best_run,
-            };
-            if replace {
+            let found = entry::detect(&plain, end as u64, archive_end, declared).map(|(s, n)| (s, n, false))
+                .or_else(|| entry::detect_compact(&plain, data, end as u64).map(|(s, n)| (s, n, true)));
+            let Some((start, run, compact)) = found else { continue };
+            if best.as_ref().is_none_or(|(best_run, ..)| run > *best_run) {
                 best = Some((run, start, plain, compact));
                 best_key = index;
             }
         }
-        let (run, start, plain, compact) = best.expect("at least one key exists");
-        if run == 0 && declared > 0 {
-            bail!("no table records recovered with any key");
-        }
-        if compact {
-            let mut entries = entry::parse_compact(&plain, start, run);
-            name(&mut entries, &entry::name_hashes(&plain, start, true));
-            return Ok(Self { data, header, entries, key_index: best_key });
-        }
-        let skip = if declared > 0 && run == declared + 1 { 1 } else { 0 };
-        let count = if declared == 0 { run } else { declared.min(run) };
-        let trailer = header.trailer_size as u64;
-        let archive_end = (data.len() as u64).saturating_sub(trailer);
-        let table_at = start + skip * entry::RECORD;
-        let mut entries = entry::parse(&plain, table_at, run.saturating_sub(skip), count, archive_end);
-        name(&mut entries, &entry::name_hashes(&plain, table_at, false));
-
+        let Some((run, start, plain, compact)) = best else {
+            if declared > 0 { bail!("no table records recovered with any key"); }
+            return Ok(Self { data, header, entries: Vec::new(), key_index: 0 });
+        };
+        let mut entries = if compact { entry::parse_compact(&plain, start, run) } else { entry::parse(&plain, start, run) };
+        name(&mut entries, &entry::name_hashes(&plain, start, compact));
         Ok(Self { data, header, entries, key_index: best_key })
     }
 
@@ -99,11 +82,17 @@ impl<'a> Archive<'a> {
             bail!("entry #{} overflows archive ({end:#x} > {:#x})", entry.index, self.data.len());
         }
         let raw = &self.data[start..end];
-        if entry.is_zlib(self.data) {
-            inflate_zlib_chain(raw)
-        } else {
-            Ok(vec![raw.to_vec()])
+        if !entry.is_zlib(self.data) {
+            return Ok(vec![raw[..entry.raw_len() as usize].to_vec()]);
         }
+        // A resource of more than 64 KiB is one zlib stream per 64 KiB, all inside this entry's
+        // stored span; the declared decoded size counts every part.
+        let blocks = inflate_zlib_chain(raw)?;
+        let total: usize = blocks.iter().map(Vec::len).sum();
+        if let Some(d) = entry.decoded_size.filter(|&d| d != total as u64) {
+            bail!("entry #{} inflates to {total:#x} bytes in {} parts, but its record declares {d:#x}", entry.index, blocks.len());
+        }
+        Ok(blocks)
     }
 }
 

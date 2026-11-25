@@ -249,7 +249,7 @@ src/
   rpf9/             the archive container
     header.rs       fixed header
     crypto.rs       T-table cipher, key schedules, CBC
-    entry.rs        TOC records (indexed, stored and compact layouts), name hash column
+    entry.rs        TOC records (24-byte and compact layouts), name hash column
     reader.rs       Archive::open with key discovery, entry reads, format sniffing
     writer.rs       in-place replace and full repack
     psin.rs         PSIN / PSO data

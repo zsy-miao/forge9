@@ -148,7 +148,7 @@ mod tests {
         let mut data = Vec::new();
         for (i, p) in payloads.iter().enumerate() {
             let at = (HEADER_SIZE + toc.len() + data.len()) as u64;
-            for (k, v) in [at / 16, (p.len() as u64).div_ceil(16), p.len() as u64].iter().enumerate() {
+            for (k, v) in [at / 16, (p.len() as u64).div_ceil(16), crate::rpf9::reader::decode(p).unwrap().len() as u64].iter().enumerate() {
                 toc[i * 24 + k * 8..i * 24 + k * 8 + 8].copy_from_slice(&v.to_le_bytes());
             }
             data.extend(p);

@@ -526,7 +526,8 @@ fn cmd_list(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, limit: usize, 
         let total = rows.len().min(limit);
         for (i, (p, entry, ext, _)) in rows.iter().take(limit).enumerate() {
             let comma = if i + 1 >= total { "" } else { "," };
-            println!("  {{\"path\":\"{p}\",\"index\":{},\"offset\":{},\"size\":{},\"flags\":{},\"ext\":\"{ext}\"}}{comma}", entry.index, entry.offset, entry.size, entry.flags);
+            let decoded = entry.decoded_size.map_or("null".into(), |d| d.to_string());
+            println!("  {{\"path\":\"{p}\",\"index\":{},\"offset\":{},\"size\":{},\"decoded\":{decoded},\"flags\":{},\"ext\":\"{ext}\"}}{comma}", entry.index, entry.offset, entry.size, entry.flags);
         }
         println!("]");
     } else {
@@ -583,7 +584,7 @@ fn stats(archive: &rpf9::reader::Archive, crypto: &rpf9::crypto::CryptoContext) 
     walk(archive, "", crypto, &mut |path, a, e, nested| {
         if nested { s.nested += 1; return; }
         let (ext, zlib) = (a.sniff(e), e.is_zlib(a.data()));
-        let inflated = if zlib { content(a, e).len() as u64 } else { e.size };
+        let inflated = if zlib { content(a, e).len() as u64 } else { e.raw_len() };
         s.entries += 1;
         s.zlib += zlib as usize;
         s.stored += e.size;
@@ -809,7 +810,7 @@ fn catalog(archives: &[(String, rpf9::reader::Archive)], crypto: &rpf9::crypto::
     for (name, archive) in archives { walk(archive, "", crypto, &mut |path, a, e, nested| {
         let zlib = e.is_zlib(a.data());
         let bytes = if nested && !zlib { Vec::new() } else { content(a, e) };
-        let inflated = if zlib { bytes.len() as u64 } else { e.size };
+        let inflated = if zlib { bytes.len() as u64 } else { e.raw_len() };
         let labels = if nested { Vec::new() } else { formats::drawable::labels(&bytes) };
         rows.push(CatalogRow { archive: name.clone(), path: path.to_string(), hash: e.name_hash, ext: a.sniff(e), stored: e.size,
             inflated, name: (!labels.is_empty()).then(|| labels.join(", ")), evidence: "embedded resource label", candidates: Vec::new() });
@@ -1866,22 +1867,25 @@ mod tests {
     /// An archive of `payloads` in the stored record layout `{offset/16, ceil(size/16), size}`.
     fn archive(crypto: &CryptoContext, payloads: &[Vec<u8>]) -> Vec<u8> { named_archive(crypto, payloads, &[]) }
 
-    /// `archive`, with a TOC column directory placing `names` as the name hash column after the records.
+    /// `archive`, with a TOC column directory before the records placing `names` as the name hash
+    /// column after them.
     fn named_archive(crypto: &CryptoContext, payloads: &[Vec<u8>], names: &[u32]) -> Vec<u8> {
         let records = payloads.len() * 24;
-        let mut toc = vec![0u8; records];
+        let mut toc = Vec::new();
         if !names.is_empty() {
-            for (id, count, off, stride) in [(0x33f7_0dfa_f2c5_0989u64, payloads.len(), 0, 24u64), (0xb707_6b62_45d3_5fb5, names.len(), records + 48, 4)] {
+            for (id, count, off, stride) in [(0x33f7_0dfa_f2c5_0989u64, payloads.len(), 0, 24u64), (0xb707_6b62_45d3_5fb5, names.len(), records, 4)] {
                 toc.extend([id.to_le_bytes(), ((count as u64) | (off as u64) << 32).to_le_bytes(), stride.to_le_bytes()].concat());
             }
-            toc.extend(names.iter().flat_map(|h| h.to_le_bytes()));
         }
+        let base = toc.len();
+        toc.resize(base + records, 0);
+        toc.extend(names.iter().flat_map(|h| h.to_le_bytes()));
         toc.resize((toc.len() + 16).next_multiple_of(16), 0);
         let mut data = Vec::new();
         for (i, p) in payloads.iter().enumerate() {
             let at = (HEADER_SIZE + toc.len() + data.len()) as u64;
-            for (k, v) in [at / 16, (p.len() as u64).div_ceil(16), p.len() as u64].iter().enumerate() {
-                toc[i * 24 + k * 8..i * 24 + k * 8 + 8].copy_from_slice(&v.to_le_bytes());
+            for (k, v) in [at / 16, (p.len() as u64).div_ceil(16), rpf9::reader::decode(p).unwrap().len() as u64].iter().enumerate() {
+                toc[base + i * 24 + k * 8..base + i * 24 + k * 8 + 8].copy_from_slice(&v.to_le_bytes());
             }
             data.extend(p);
             data.resize(data.len().next_multiple_of(16), 0);
@@ -1905,6 +1909,32 @@ mod tests {
     fn sample(crypto: &CryptoContext, b: &[u8], level: u32) -> Vec<u8> {
         let nested = archive(crypto, &[b"alpha".to_vec(), b.to_vec()]);
         archive(crypto, &[b"<?xml version='1.0'?><a/>".to_vec(), nested, zlib(&[b'c'; 1000], level)])
+    }
+
+    #[test]
+    fn two_part_entry_reads_both_parts_from_its_own_span() {
+        // 0x10100 bytes: a 64 KiB zlib part and a 0x100 part, both in entry 0's stored span,
+        // then a neighbour that is not a continuation.
+        let crypto = crypto();
+        let content: Vec<u8> = (0..0x10100u32).map(|i| (i * 7 % 251) as u8).collect();
+        let chain = rpf9::writer::zlib_chain(&content).unwrap();
+        let raw = archive(&crypto, &[chain.clone(), b"next".to_vec()]);
+        let a = Archive::open(&raw, &crypto).unwrap();
+        let e = &a.entries()[0];
+        assert_eq!((e.size, e.decoded_size), (chain.len() as u64, Some(0x10100)));
+        let parts = a.read_entry_blocks(e).unwrap();
+        assert_eq!(parts.iter().map(Vec::len).collect::<Vec<_>>(), [0x10000, 0x100]);
+        assert_eq!(parts.concat(), content);
+        assert_eq!(a.read_entry(&a.entries()[1]).unwrap(), b"next");
+        // A record declaring only the first part's length is reported, not silently cut.
+        let mut bad = raw.clone();
+        let toc = &mut bad[HEADER_SIZE..HEADER_SIZE + 64];
+        crypto.schedule(0).unwrap().decrypt_cbc(toc, &TAG_IV);
+        toc[16..24].copy_from_slice(&0x10000u64.to_le_bytes());
+        crypto.schedule(0).unwrap().encrypt_cbc(toc, &TAG_IV);
+        let a = Archive::open(&bad, &crypto).unwrap();
+        let err = a.read_entry(&a.entries()[0]).unwrap_err().to_string();
+        assert_eq!(err, "entry #0 inflates to 0x10100 bytes in 2 parts, but its record declares 0x10000");
     }
 
     #[test]
